@@ -72,7 +72,7 @@ def compile_exe():
     zb.deletePath(BUILD_PATH)
     zb.createDir(BUILD_PATH)
     if USE_NUITKA:
-        cmd = [sys.executable, "-m", "nuitka", "--clang", "--assume-yes-for-downloads", "--show-progress", f"--force-stdout-spec={zb.joinPath(zb.TEMP_PATH, NAME + ".log")}", f"--force-stderr-spec={zb.joinPath(zb.TEMP_PATH, NAME + ".log")}",
+        cmd = [sys.executable, "-m", "nuitka", "--clang", "--assume-yes-for-downloads", "--show-progress",
                "--standalone", "--windows-console-mode=disable", "--enable-plugin=pyside6", *[f"--include-package={i}" for i in EXTRA_LIBS], *[f"--include-package-data={i}" for i in EXTRA_LIBS],
                "--remove-output", f"--output-dir={BUILD_PATH}", "--follow-imports", "--show-scons", f"--windows-icon-from-ico={ICON_PATH}",
                f"--output-folder-name={NAME}", f"--output-filename={NAME}" + (" --onefile" if IS_SINGLE_FILE else ""),
