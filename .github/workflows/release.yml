@@ -35,21 +35,13 @@ jobs:
       - name: 安装项目
         run: uv sync --locked --all-extras --dev
 
-      - name: 读取 index.json
-        id: read_index
-        shell: pwsh
-        run: |
-          $index = Get-Content -Raw index.json | ConvertFrom-Json
-          Write-Output "version=$($index.version)" >> $env:GITHUB_OUTPUT
-          Write-Output "version_code=$($index.version_code)" >> $env:GITHUB_OUTPUT
-
       - name: 编译程序
         shell: pwsh
         run: |
           $inputVersion = "${{ github.event.inputs.version }}"
           if ([string]::IsNullOrEmpty($inputVersion)) {
-            Write-Host "未指定版本号，使用 index.json 版本"
-            uv run script\release_build.py -v "${{ steps.read_index.outputs.version }}"
+            Write-Host "未指定版本号，使用当前版本号"
+            uv run script\release_build.py
           } else {
             Write-Host "使用指定版本号: $inputVersion"
             uv run script\release_build.py -v "$inputVersion"
