@@ -7,7 +7,6 @@ NAME = "zbProgram"
 LOG_INDEX = "exe版"
 IS_SINGLE_FILE = False
 IS_SETUP = True
-USE_NUITKA = True
 EXTRA_FILES = []
 EXTRA_LIBS = ["zbWidgetLib", "xml"]
 
