@@ -51,6 +51,14 @@ def replace_index_json(version: str, version_code: int):
     print("已修改index.json版本号！")
 
 
+def replace_pyproject_toml(version: str):
+    import toml
+    data = toml.load(PYPROJECT_TOML)
+    data["project"]["version"] = version
+    toml.dump(data, PYPROJECT_TOML)
+    print("已修改pyproject.toml版本号！")
+
+
 def extract_release_notes():
     html = read_text(INDEX_HTML)
     if LOG_INDEX:
@@ -138,6 +146,7 @@ if __name__ == "__main__":
 
     replace_index_json(version, new_version_code)
     replace_version_in_program(version, new_version_code)
+    replace_pyproject_toml(version)
     if IS_SETUP:
         replace_version_in_setup(version)
 

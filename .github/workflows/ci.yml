@@ -29,17 +29,11 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: 更新 pip
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
 
-      - name: 安装 Python 运行库
-        shell: pwsh
-        run: |
-          Write-Host "正在安装运行库..."
-          python -m pip install -r requirements.txt
-          Write-Host "运行库安装完成。"
+      - name: 安装项目
+        run: uv sync --locked --all-extras --dev
 
       - name: 读取 index.json 版本号
         id: get_version
@@ -60,7 +54,7 @@ jobs:
       - name: 编译程序
         shell: pwsh
         run: |
-          python script\release_build.py -v "${{ steps.generate_ci_version.outputs.ci_version }}"
+          uv run script\release_build.py -v "${{ steps.generate_ci_version.outputs.ci_version }}"
 
       - name: 编译安装程序
         uses: Minionguyjpro/Inno-Setup-Action@v1.2.7
