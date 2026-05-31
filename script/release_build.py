@@ -55,7 +55,8 @@ def replace_pyproject_toml(version: str):
     import toml
     data = toml.load(PYPROJECT_TOML)
     data["project"]["version"] = version
-    toml.dump(data, PYPROJECT_TOML)
+    with open(PYPROJECT_TOML, "w", encoding="utf-8") as file:
+        toml.dump(data, file)
     print("已修改pyproject.toml版本号！")
 
 
