@@ -58,18 +58,13 @@ jobs:
         shell: pwsh
         run: |
           $out = Get-Content -Raw script\release_output.json | ConvertFrom-Json
-          Write-Output "zip=$($out.output)" >> $env:GITHUB_OUTPUT
-          Write-Output "version_code=$($out.version_code)" >> $env:GITHUB_OUTPUT
+          $version = $out.version
+          $version_code = $out.version_code
+          Write-Output "zip=$out.output" >> $env:GITHUB_OUTPUT
+          Write-Output "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Output "version_code=$version_code" >> $env:GITHUB_OUTPUT
           $notes = $out.release_notes -replace "`r`n", "`n"
           Write-Output "notes=$notes" >> $env:GITHUB_OUTPUT
-
-      - name: 重新读取 index.json
-        id: read_new_index
-        shell: pwsh
-        run: |
-          $index = Get-Content -Raw index.json | ConvertFrom-Json
-          Write-Output "version=$($index.version)" >> $env:GITHUB_OUTPUT
-          Write-Output "version_code=$($index.version_code)" >> $env:GITHUB_OUTPUT
 
       - name: 提交版本更新
         shell: pwsh
@@ -83,7 +78,7 @@ jobs:
             git pull --rebase origin main
             git stash pop
             git add -u
-            git commit -m "Update version to ${{ steps.read_new_index.outputs.version }} (code ${{ steps.check_output.outputs.version_code }}) [ci skip]"
+            git commit -m "Update version to ${{ steps.check_output.outputs.version }} (code ${{ steps.check_output.outputs.version_code }}) [ci skip]"
             git push origin main
           } else {
             Write-Host "无版本变更"
@@ -92,11 +87,11 @@ jobs:
       - name: 发布 GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          name: ${{ steps.read_new_index.outputs.version }}
-          tag_name: ${{ steps.read_new_index.outputs.version }}
+          name: ${{ steps.check_output.outputs.version }}
+          tag_name: ${{ steps.check_output.outputs.version }}
           files: |
-            ${{ env.PROGRAM_NAME }}_${{ steps.read_new_index.outputs.version }}.zip
-            ${{ env.PROGRAM_NAME }}_${{ steps.read_new_index.outputs.version }}_setup.exe
+            ${{ env.PROGRAM_NAME }}_${{ steps.check_output.outputs.version }}.zip
+            ${{ env.PROGRAM_NAME }}_${{ steps.check_output.outputs.version }}_setup.exe
           body: ${{ steps.check_output.outputs.notes }}
           token: ${{ secrets.GITHUB_TOKEN }}
           draft: false
@@ -114,5 +109,5 @@ jobs:
           $auth = "$($Env:DUFS_USER):$($Env:DUFS_PASSWORD)"
 
           curl --fail --silent --show-error --user $auth -T "index.json"     "$base/code/${{ env.PROGRAM_NAME }}/index.json"
-          curl --fail --silent --show-error --user $auth -T "${{ env.PROGRAM_NAME }}_${{ steps.read_new_index.outputs.version }}.zip" "$base/code/${{ env.PROGRAM_NAME }}/${{ env.PROGRAM_NAME }}.zip"
-          curl --fail --silent --show-error --user $auth -T "${{ env.PROGRAM_NAME }}_${{ steps.read_new_index.outputs.version }}_setup.exe" "$base/code/${{ env.PROGRAM_NAME }}/${{ env.PROGRAM_NAME }}_setup.exe"
+          curl --fail --silent --show-error --user $auth -T "${{ env.PROGRAM_NAME }}_${{ steps.check_output.outputs.version }}.zip" "$base/code/${{ env.PROGRAM_NAME }}/${{ env.PROGRAM_NAME }}.zip"
+          curl --fail --silent --show-error --user $auth -T "${{ env.PROGRAM_NAME }}_${{ steps.check_output.outputs.version }}_setup.exe" "$base/code/${{ env.PROGRAM_NAME }}/${{ env.PROGRAM_NAME }}_setup.exe"
