@@ -63,14 +63,14 @@ jobs:
           options: /O+
 
       - name: 上传构建产物
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.PROGRAM_NAME }}_${{ steps.generate_ci_version.outputs.ci_version }}.zip
           path: ${{ env.PROGRAM_NAME }}_${{ steps.generate_ci_version.outputs.ci_version }}.zip
           retention-days: 7
 
       - name: 上传安装程序产物
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.PROGRAM_NAME }}_${{ steps.generate_ci_version.outputs.ci_version }}_setup.zip
           path: ${{ env.PROGRAM_NAME }}_${{ steps.generate_ci_version.outputs.ci_version }}_setup.exe
