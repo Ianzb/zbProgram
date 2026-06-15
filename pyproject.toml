@@ -1,50 +1,7 @@
 [project]
 name = "zbProgram"
-version = "0.1.0"
+version = "5.11.3"
 description = "zb小程序是一款使用Python开发，基于PySide6和PySide6-Fluent-Widgets开发的开源桌面应用程序。"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = [
-    "aenum==3.1.17",
-    "altgraph==0.17.5",
-    "annotated-types==0.7.0",
-    "attrs==26.1.0",
-    "beautifulsoup4==4.15.0",
-    "certifi==2026.5.20",
-    "charset-normalizer==3.4.7",
-    "clang==21.1.7",
-    "colorthief==0.2.1",
-    "darkdetect==0.8.0",
-    "idna==3.18",
-    "mailbits==0.2.3",
-    "nuitka==4.1.2",
-    "numpy==2.4.6",
-    "packaging==26.2",
-    "pefile==2024.8.26",
-    "pillow==12.2.0",
-    "puremagic==2.2.0",
-    "pydantic==2.13.4",
-    "pydantic-core==2.46.4",
-    "pypi-simple==1.8.0",
-    "pyside6==6.10.3",
-    "pyside6-addons==6.10.3",
-    "pyside6-essentials==6.10.3",
-    "pyside6-fluent-widgets==1.11.2",
-    "pysidesix-frameless-window==0.8.1",
-    "pywin32==312",
-    "pywin32-ctypes==0.2.3",
-    "qtpy==2.4.3",
-    "requests==2.34.2",
-    "scipy==1.17.1",
-    "send2trash==2.1.0",
-    "setuptools==82.0.1",
-    "shiboken6==6.10.3",
-    "soupsieve==2.8.4",
-    "toml==0.10.2",
-    "typing-extensions==4.15.0",
-    "typing-inspection==0.4.2",
-    "urllib3==2.7.0",
-    "winshell==0.6",
-    "zbtoollib==2.0.8.1",
-    "zbwidgetlib==3.6.1",
-]
+dependencies = [ "aenum==3.1.17", "altgraph==0.17.5", "annotated-types==0.7.0", "attrs==26.1.0", "beautifulsoup4==4.15.0", "certifi==2026.5.20", "charset-normalizer==3.4.7", "clang==21.1.7", "colorthief==0.2.1", "darkdetect==0.8.0", "idna==3.18", "mailbits==0.2.3", "nuitka==4.1.2", "numpy==2.4.6", "packaging==26.2", "pefile==2024.8.26", "pillow==12.2.0", "puremagic==2.2.0", "pydantic==2.13.4", "pydantic-core==2.46.4", "pypi-simple==1.8.0", "pyside6==6.10.3", "pyside6-addons==6.10.3", "pyside6-essentials==6.10.3", "pyside6-fluent-widgets==1.11.2", "pysidesix-frameless-window==0.8.1", "pywin32==312", "pywin32-ctypes==0.2.3", "qtpy==2.4.3", "requests==2.34.2", "scipy==1.17.1", "send2trash==2.1.0", "setuptools==82.0.1", "shiboken6==6.10.3", "soupsieve==2.8.4", "toml==0.10.2", "typing-extensions==4.15.0", "typing-inspection==0.4.2", "urllib3==2.7.0", "winshell==0.6", "zbtoollib==2.0.8.1", "zbwidgetlib==3.6.1",]
