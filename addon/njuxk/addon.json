@@ -1,0 +1,25 @@
+{
+  "id": "njuxk",
+  "name": "南大选课",
+  "author": "",
+  "description": "南京大学选课平台 GUI 抢课插件",
+  "version": "0.1.0",
+  "version_code": 1,
+  "api_version": 9,
+  "icon": "",
+  "file": "",
+  "history": {
+    "0.1.0": {
+      "time": "2026年8月30日",
+      "log": "首个版本。"
+    }
+  },
+  "packages": [
+    "onnxruntime>=1.19.0",
+    "pycryptodome>=3.19.0",
+    "pillow",
+    "numpy",
+    "requests"
+  ],
+  "url": ""
+}
