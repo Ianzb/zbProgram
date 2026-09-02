@@ -88,8 +88,19 @@ def clear_favorites(setting) -> None:
 
 
 def save_account(setting, user, pwd):
+    """保存当前账号（顶层键 user/pwd）并同时 upsert 进多账号列表 accounts。
+
+    - 顶层键维持既有语义（凭据 provider / has_saved_account 依赖）；
+    - ``user`` 非空时同步 upsert 进 ``accounts`` 列表（同 user 覆盖 pwd 与
+      ``last_used``，否则追加）——登录界面据此展示「已保存的账号」；
+    - ``user`` 为空串（清空场景）只写顶层键，不往列表里塞空账号。
+    """
     setting.save("user", user)
     setting.save("pwd", pwd)
+    if isinstance(user, str) and user:
+        accounts = list_accounts(setting)
+        _upsert_account(accounts, user, pwd)
+        setting.save("accounts", accounts)
 
 
 def load_account(setting) -> tuple:
@@ -101,6 +112,103 @@ def load_account(setting) -> tuple:
     if not isinstance(pwd, str):
         pwd = ""
     return user, pwd
+
+
+def list_accounts(setting) -> list:
+    """返回多账号列表（按 ``last_used`` 降序，最近使用的在前）。
+
+    容错：键缺失 / 非 list / 元素非 dict / 学号非字符串或为空 —— 一律过滤，
+    只返回合法账号（元素形如 ``{"user": str, "pwd": str, "last_used": float}``）。
+    """
+    value = setting.read("accounts")
+    if not isinstance(value, list):
+        return []
+    accounts = [
+        acc for acc in value
+        if isinstance(acc, dict) and isinstance(acc.get("user"), str) and acc["user"]
+    ]
+    accounts.sort(key=_account_last_used, reverse=True)
+    return accounts
+
+
+def _account_last_used(acc) -> float:
+    """取 ``last_used`` 并宽松转 float（缺失 / 非法一律 0.0，排最后）。"""
+    try:
+        return float(acc.get("last_used"))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _upsert_account(accounts: list, user: str, pwd: str) -> list:
+    """同 user 覆盖 pwd / last_used，否则追加；返回同一列表（原地修改）。"""
+    now = time.time()
+    for acc in accounts:
+        if isinstance(acc, dict) and acc.get("user") == user:
+            acc["pwd"] = pwd
+            acc["last_used"] = now
+            return accounts
+    accounts.append({"user": user, "pwd": pwd, "last_used": now})
+    return accounts
+
+
+def delete_account(setting, user) -> bool:
+    """从多账号列表**永久**移除该账号；返回是否真的删除了。
+
+    若被删的正是当前顶层账号（``user`` 顶层键），同步清空顶层键
+    （等价 ``save_account(setting, "", "")``，不产生空列表元素）。
+    """
+    value = setting.read("accounts")
+    accounts = value if isinstance(value, list) else []
+    kept = [
+        acc for acc in accounts
+        if not (isinstance(acc, dict) and acc.get("user") == user)
+    ]
+    if len(kept) == len(accounts):
+        return False
+    setting.save("accounts", kept)
+    current = setting.read("user")
+    if isinstance(current, str) and current == user:
+        save_account(setting, "", "")
+    return True
+
+
+def load_last_account(setting) -> tuple:
+    """最近使用的账号 -> (user, pwd)；列表为空回退顶层键 user/pwd。
+
+    供启动自动登录使用：多账号场景下自动登录最近一次用过的账号。
+    """
+    accounts = list_accounts(setting)
+    if accounts:
+        user = accounts[0].get("user")
+        pwd = accounts[0].get("pwd")
+        return (
+            user if isinstance(user, str) else "",
+            pwd if isinstance(pwd, str) else "",
+        )
+    return load_account(setting)
+
+
+def migrate_accounts(setting) -> None:
+    """老设置迁移：``accounts`` 为空且顶层 ``user`` 非空 → 种子化列表（幂等）。
+
+    老用户 settings.json 里只有顶层 user/pwd，首次运行新版本时把这对凭据
+    种进 accounts 列表（无感迁移）；已有 accounts 或顶层无账号时不做任何事，
+    可安全重复调用。
+    """
+    if setting is None:
+        return
+    accounts = setting.read("accounts")
+    if isinstance(accounts, list) and accounts:
+        return
+    user = setting.read("user")
+    if not (isinstance(user, str) and user):
+        return
+    pwd = setting.read("pwd")
+    setting.save("accounts", [{
+        "user": user,
+        "pwd": pwd if isinstance(pwd, str) else "",
+        "last_used": time.time(),
+    }])
 
 
 def save_session(setting, cookies: dict, token: str):

@@ -8,6 +8,8 @@ from __future__ import annotations
 DEFAULTS = {
     "user": "",
     "pwd": "",
+    # 多账号列表（高级多账户管理）：元素 {"user": str, "pwd": str, "last_used": float}
+    "accounts": [],
     "session": {"cookies": {}, "token": "", "timestamp": 0},
     "favorites": [],
     "scheduler": {
@@ -16,7 +18,11 @@ DEFAULTS = {
         "delay_min": 1.0,
         "delay_max": 2.0,
         "repeat": 0,
+        # 新建任务默认开启定时开始（2026-08-31 需求，设置页可改）
+        "use_timed_start": True,
         "max_workers": 3,
+        # 全局令牌桶最小请求间隔（秒）：设置页可改，scheduler.MIN_INTERVAL 为出厂默认
+        "min_interval": 0.35,
         "qos_backoff_base": 3.0,
         "qos_backoff_max": 15.0,
     },
@@ -43,9 +49,25 @@ _SCHEDULER_NUMERIC = {
     "delay_max": (2.0, float),
     "repeat": (0, _to_int),
     "max_workers": (3, _to_int),
+    "min_interval": (0.35, float),
     "qos_backoff_base": (3.0, float),
     "qos_backoff_max": (15.0, float),
 }
+
+
+def _to_bool(value, default=True):
+    """宽松 bool 转换：bool 直通；str 识别 true/false/1/0/on/off；其余回退默认。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off"):
+            return False
+    return default
 
 # 旧版默认延迟区间（0.5, 1.5）：老用户 settings.json 里已持久化了这对值
 # （setting.adds 注册时会把默认值写进实际存储），读取时视为「未定制」迁移到新默认。
@@ -59,6 +81,7 @@ def _normalize_scheduler(raw) -> dict:
         cfg.update(raw)
     for key, (default, cast) in _SCHEDULER_NUMERIC.items():
         cfg[key] = _coerce(cfg[key], default, cast)
+    cfg["use_timed_start"] = _to_bool(cfg["use_timed_start"], True)
     if cfg["delay_min"] > cfg["delay_max"]:
         cfg["delay_min"], cfg["delay_max"] = cfg["delay_max"], cfg["delay_min"]
     return cfg

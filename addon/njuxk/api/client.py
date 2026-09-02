@@ -18,6 +18,9 @@
   courseKind / teachingClassType（只有报名才有）；
 - 结果轮询：studentstatus.do，code ``0``=处理中 / ``1``=成功 / ``-1``=失败 / timeout；
   ``type`` 区分操作：``"1"``=报名后轮询、``"0"``=退课后轮询（网页源码确证）；
+- 课程详情：querykcxx.do 表单 ``kch/jxbid/xklcdm``（抓包 [12]）、
+  courseSchedule.do 表单 ``querySetting={data:{studentCode, other, electiveBatchCode}}``
+  （抓包 [14]），响应原样返回 dict，编码键映射表见 ``ui/cards.py``；
 - 退出登录：串行两步 ``student/logout.do``（表单 ``studentNumber``）→ 成功后
   ``student/authlogout.do``（空表单），均带 token 头；**不调用 CAS 登出**
   （本页 ``loginType='ldap'``，CAS 分支不触发，且会踢掉统一身份认证单点登录）。
@@ -62,6 +65,9 @@ PUBLIC_COURSE = "/elective/publicCourse.do"
 VOLUNTEER = "/elective/volunteer.do"
 DELETE_VOLUNTEER = "/elective/deleteVolunteer.do"
 STUDENT_STATUS = "/elective/studentstatus.do"
+COURSE_INFO = "/publicinfo/querykcxx.do"
+COURSE_SCHEDULE = "/elective/courseSchedule.do"
+COURSE_RESULT = "/elective/courseResult.do"
 LOGOUT = "/student/logout.do"
 AUTH_LOGOUT = "/student/authlogout.do"
 
@@ -402,6 +408,102 @@ class XkClient:
         )
         rows = result.get("dataList") or []
         return rows, len(rows) < page_size
+
+    # ------------------------------------------------------------------
+    # 课程详情（详细信息大纲 + 教学周历，抓包 [12]/[14]）
+    # ------------------------------------------------------------------
+
+    def fetch_course_info(
+            self,
+            teaching_class_id: str,
+            course_number: str,
+            batch_code: str,
+    ) -> Dict[str, Any]:
+        """查询课程详细信息（publicinfo/querykcxx.do，抓包 [12]）。
+
+        表单字段与抓包逐字一致：``kch=课程号 & jxbid=教学班号 & xklcdm=批次码``
+        （xklcdm 取值与周历接口 querySetting 里的 electiveBatchCode 相同）。
+        响应原样返回 dict（``data`` 节点为课程大纲各字段，编码键的映射表见
+        ``ui/cards.py`` 的 ``_COURSE_INFO_FIELDS`` / ``_COURSE_HOURS_FIELDS`` /
+        ``_COURSE_DETAIL_SECTIONS`` 注释），解析在 UI 层做，与项目风格一致。
+        """
+        form = {
+            "kch": course_number,
+            "jxbid": teaching_class_id,
+            "xklcdm": batch_code,
+        }
+        return self._post(COURSE_INFO, data=form, timeout=15)
+
+    def fetch_course_schedule(
+            self,
+            teaching_class_id: str,
+            batch_code: str,
+    ) -> Dict[str, Any]:
+        """查询教学周历（elective/courseSchedule.do，抓包 [14]）。
+
+        表单只有 ``querySetting`` 一个字段：``{"data":{"studentCode":学号,
+        "other":教学班号,"electiveBatchCode":批次码}}``（JSON 序列化后由
+        requests 做 URL 编码，与抓包一致）。响应原样返回 dict，周历逐条在
+        ``dataList``（编码键的映射表见 ``ui/cards.py`` 的
+        ``_SCHEDULE_FIELDS`` 注释）。
+        """
+        query_setting = {
+            "data": {
+                "studentCode": self.student_code,
+                "other": teaching_class_id,
+                "electiveBatchCode": batch_code,
+            }
+        }
+        return self._post(
+            COURSE_SCHEDULE,
+            data={"querySetting": json.dumps(query_setting)},
+            timeout=15,
+        )
+
+    def fetch_course_results(
+            self,
+            other: str,
+            batch_code: str,
+            page_size: int = 50,
+            page_number: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """查询选课结果（elective/courseResult.do，抓包 [2]/[3]）。
+
+        ``other`` 语义（网页 JS 确证，两种请求**仅该字段不同**）：
+        - ``"01"`` → **我的报名**（报名/抽签队列，行 ``selectStatus`` 全 ``"01"``，
+          ``canDelete=="1"`` 可取消报名）；
+        - ``"99"`` → **我的课程**（已选中的课，行 ``selectStatus`` 全 ``"99"``，
+          ``canDelete`` 同样为 ``"1"/"0"``，删除走同一接口）。
+
+        表单与抓包逐字段一致：``querySetting={"data":{studentCode,
+        electiveBatchCode, other, teachingClassType:"QB", queryContent:""},
+        pageSize, pageNumber, order:""}``（teachingClassType 固定 ``"QB"``
+        = 全部类别；pageSize/pageNumber 用 50/0 单页拉全，抓包原值 10/0）。
+
+        返回 ``dataList``（行含 ``comment`` 备注 / ``canDelete`` / ``kclx`` /
+        ``teachingPlace`` / ``numberOfFirstVolunteer``（**可能是「已满」这类
+        字符串**，解析层不得参与数值计算）等 16+ 字段），缺失时为空列表。
+        """
+        if other not in ("01", "99"):
+            raise ValueError(f"other 只允许 '99'（我的课程）/ '01'（我的报名）：{other!r}")
+        query_setting = {
+            "data": {
+                "studentCode": self.student_code,
+                "electiveBatchCode": batch_code,
+                "other": other,
+                "teachingClassType": "QB",
+                "queryContent": "",
+            },
+            "pageSize": str(page_size),
+            "pageNumber": str(page_number),
+            "order": "",
+        }
+        result = self._post(
+            COURSE_RESULT,
+            data={"querySetting": json.dumps(query_setting)},
+            timeout=15,
+        )
+        return result.get("dataList") or []
 
     # ------------------------------------------------------------------
     # 报名与结果轮询

@@ -63,7 +63,7 @@ CATEGORY_MIN_WIDTH = 400
 #: 搜索框最小宽度（工具行里唯一可伸缩的控件，缩到这个值就不再让位）
 SEARCH_MIN_WIDTH = 180
 #: 登录卡最大宽度（MainPage 登录层里居中显示，不随窗口拉宽）
-LOGIN_CARD_MAX_WIDTH = 480
+LOGIN_CARD_MAX_WIDTH = 560
 
 
 def apply_page_margins(layout: QLayout) -> QLayout:

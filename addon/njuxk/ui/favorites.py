@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 
 from qtpy.QtCore import Qt, Signal
-from qtpy.QtWidgets import QHBoxLayout
+from qtpy.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget
 
 from qfluentwidgets import (
     BodyLabel,
@@ -42,6 +42,7 @@ from qfluentwidgets import (
     InfoBarPosition,
     PrimaryPushButton,
     PushButton,
+    SmoothScrollArea,
 )
 
 import zbWidgetLib as zbw
@@ -50,13 +51,21 @@ from ..api import models
 from ..api.client import XkClient
 from ..core import state
 from .cards import CourseCard
-from .layout import apply_page_margins, apply_tool_row
+from .layout import SPACING, apply_page_margins, apply_tool_row
 from .login import _host_program, _host_setting
 from .text_select import make_selectable
 
 
-class FavoritesPage(zbw.BasicTab):
+class FavoritesPage(QWidget):
     """收藏页：本地收藏列表 + 移除 + 刷新占用 + 一键开始全部抢课。
+
+    布局（用户要求「收藏和任务界面的顶栏也要固定」，对齐 ``ui/course.py``）：
+    本页**不再**继承 ``zbw.BasicTab``（BasicTab 整页就是一个纵向滚动区，工具行
+    会跟着收藏卡片一起滚走），改为普通 ``QWidget`` 页根布局 + 内部唯一一个纵向
+    ``SmoothScrollArea``（``favScroll``）—— 工具行（刷新占用 / 一键开始全部抢课 /
+    跳过已满课程 / 清空收藏）固定在页根，只有收藏卡片列表（cardGroup /
+    emptyLabel）在 ``favScroll`` 里滚动。``BasicTabPage.addPage`` 只要求 widget
+    本身，不要求 BasicTab 类型，页签行为不变。
 
     信号：
         grabRequested(str)      —— 单个抢课请求（teaching_class_id）
@@ -65,6 +74,11 @@ class FavoritesPage(zbw.BasicTab):
             （收藏页卡片与选课页共用 ``CourseCard``，已报名时同样显示「退选」）
         favoritesChanged()      —— 收藏集合结构变化（移除/清空）
     """
+
+    # InfoBar / 对话框挂载标记：``ui/cards.py`` 的 ``_dialog_parent`` 沿 parent
+    # 链上溯找插件页面（原来只认 ``zbw.BasicTab``），本页改基类后靠此标记继续
+    # 被识别为插件页面 —— 弹窗遮罩仍覆盖整个收藏页，绝不提升到宿主主窗口
+    _info_parent_flag = True
 
     grabRequested = Signal(str)
     grabAllRequested = Signal(list)
@@ -124,10 +138,13 @@ class FavoritesPage(zbw.BasicTab):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
+        # 页根布局：工具行 + 收藏列表滚动区（前者固定，后者滚动）。
         # 边距/间距统一取自 ui.layout（与选课页、任务页、设置对话框同一套常量）
+        self.vBoxLayout = QVBoxLayout(self)
         apply_page_margins(self.vBoxLayout)
 
         # 顶部工具行：刷新占用 / 一键开始全部抢课 / 跳过已满课程 / 清空收藏
+        # （固定在页根，不随列表滚动）
         toolRow = apply_tool_row(QHBoxLayout())
         self.refreshButton = PushButton(FIF.SYNC, "刷新占用", self)
         self.grabAllButton = PrimaryPushButton(FIF.PLAY, "一键开始全部抢课", self)
@@ -141,16 +158,43 @@ class FavoritesPage(zbw.BasicTab):
         toolRow.addWidget(self.clearButton)
         self.vBoxLayout.addLayout(toolRow)
 
-        # 列表区：CardGroup 装 CourseCard
-        self.cardGroup = zbw.CardGroup(self, show_title=False, is_v=True)
-        self.vBoxLayout.addWidget(self.cardGroup, 1)
+        # ---- 列表区：唯一纵向滚动区（顶栏固定在滚动内容之外）----
+        # 用户需求「收藏和任务界面的顶栏也要固定」：此前整页继承 zbw.BasicTab
+        # （整页滚动），工具行跟着收藏卡片一起滚走。现在只有收藏列表在
+        # favScroll 里滚动，范式对齐 ui/course.py / ui/settings.py
+        # （SmoothScrollArea + widgetResizable + NoFrame + 透明背景）。
+        self.favScroll = SmoothScrollArea(self)
+        self.favScroll.setWidgetResizable(True)
+        self.favScroll.setFrameShape(QFrame.NoFrame)
+        self.favScroll.enableTransparentBackground()
+
+        # 滚动内容容器：页面边距已由 apply_page_margins 提供，这里只留少量
+        # 上下边距（顶部与固定工具行拉开一点、底部留呼吸），左右为 0
+        inner = QWidget(self.favScroll)
+        self.favScroll.setWidget(inner)
+        # inner 必须显式透明：qfw enableTransparentBackground() 只给「当时已
+        # setWidget 的内容 widget」设透明样式（本页在其之前调用 → inner 拿不到）；
+        # 而宿主 FluentWindow 的 FLUENT_WINDOW qss 会层叠进页面，使 inner
+        # autoFillBackground=True 并涂上系统窗口色（亮 #efefef，暗色主题下与
+        # 页面背景形成大色块）。写法对齐旧版 zbw.BasicTab（BetterScrollArea.view）。
+        inner.setStyleSheet("QWidget {background-color: rgba(0,0,0,0); border: none}")
+        innerLayout = QVBoxLayout(inner)
+        innerLayout.setContentsMargins(0, 4, 0, 8)
+        innerLayout.setSpacing(SPACING)
+
+        # 列表区：CardGroup 装 CourseCard（在滚动内容里，自然高度不占 stretch）
+        self.cardGroup = zbw.CardGroup(inner, show_title=False, is_v=True)
+        innerLayout.addWidget(self.cardGroup)
 
         self.emptyLabel = make_selectable(
-            BodyLabel("暂无收藏，可在选课页点击收藏按钮添加", self)
+            BodyLabel("暂无收藏，可在选课页点击收藏按钮添加", inner)
         )
         self.emptyLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.emptyLabel.setTextColor("#606060", "#d2d2d2")
-        self.vBoxLayout.addWidget(self.emptyLabel)
+        innerLayout.addWidget(self.emptyLabel)
+
+        # 收藏列表滚动区独占剩余纵向空间（stretch=1），工具行保持固有高度
+        self.vBoxLayout.addWidget(self.favScroll, 1)
 
     def _connect_signals(self):
         self.refreshButton.clicked.connect(self._on_refresh_clicked)
@@ -175,6 +219,7 @@ class FavoritesPage(zbw.BasicTab):
             if not tid:
                 continue
             card = CourseCard(self)
+            card.client = self.client
             # tactic_name 来自收藏记录（加入收藏时由选课页写入）；老记录缺该键
             # 时按空串处理，由 selection_probability 的兜底分支显示 100%
             card.set_course(

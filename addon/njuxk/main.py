@@ -8,7 +8,7 @@ except Exception as e:
     # 兜底语义不变：导入失败不抛异常，回退 app.addon；仅留 debug 日志便于排查
     logging.debug("zbProgram.app.addon 导入失败，回退 app.addon：%s", e)
 
-from qtpy.QtCore import QPoint
+from qtpy.QtCore import QPoint, Signal
 from qtpy.QtWidgets import QHBoxLayout, QStackedWidget, QVBoxLayout, QWidget
 from qfluentwidgets import (
     Action,
@@ -17,6 +17,7 @@ from qfluentwidgets import (
     PushButton,
     RoundMenu,
     SubtitleLabel,
+    ToolButton,
 )
 
 import zbWidgetLib as zbw
@@ -77,7 +78,7 @@ class MainPage(QWidget):
         ├── 顶栏（左：标题「南大选课」；右：账号按钮 + 下拉菜单）
         └── QStackedWidget
             ├── index 0: 登录层（LoginCard 居中）
-            └── index 1: BasicTabPage（选课 / 收藏 / 任务 三页签）
+            └── index 1: BasicTabPage（选课 / 收藏 / 任务 / 我的课程 / 我的报名）
 
     - 未登录：堆叠停在登录层（三页签被盖住，不可见也不可切换），账号按钮隐藏；
     - 登录成功：切到页签层，账号按钮显示学号；
@@ -88,6 +89,9 @@ class MainPage(QWidget):
 
     宿主契约：``addonWidget()`` 返回对象仍提供 ``title()`` / ``icon()``。
     """
+
+    #: 点击顶栏「设置」按钮（由装配层 XkApp 接线 → 打开 SettingsDialog）
+    settingsRequested = Signal()
 
     def title(self):
         return "南大选课"
@@ -134,6 +138,12 @@ class MainPage(QWidget):
         self.accountButton.setVisible(False)
         self.accountButton.clicked.connect(self._show_account_menu)
         topLayout.addWidget(self.accountButton)
+        # 设置入口（需求：位于账号按钮右侧）。始终可见（含未登录）——设置是
+        # 全局默认值，不依赖登录态；点击只发信号，弹窗由装配层 XkApp 打开
+        self.settingsButton = ToolButton(FIF.SETTING, self.topBar)
+        self.settingsButton.setToolTip("设置")
+        self.settingsButton.clicked.connect(self.settingsRequested.emit)
+        topLayout.addWidget(self.settingsButton)
         root.addWidget(self.topBar)
 
         # ---- 登录层 / 页签层堆叠：未登录停在登录层，三页签被盖住不可切换 ----
@@ -165,12 +175,30 @@ class MainPage(QWidget):
         loginLayout.addStretch(1)
 
     def _build_tabs(self, app):
-        """页签层（index 1）：选课 / 收藏 / 任务 三个页签。"""
+        """页签层（index 1）：选课 / 收藏 / 任务 / 我的课程 / 我的报名 五个页签。"""
         self.tabs = zbw.BasicTabPage(self)
         self.tabs.addPage(app.course_page, "选课", FIF.EDUCATION)
         self.tabs.addPage(app.favorites_page, "收藏", FIF.HEART)
         self.tabs.addPage(app.task_page, "任务", FIF.PLAY)
+        # 选课结果两页（courseResult.do）：我的报名（报名/抽签队列，other=01）/
+        # 我的课程（已选中，other=99）
+        self.tabs.addPage(app.my_enroll_page, "我的报名", FIF.SEND)
+        self.tabs.addPage(app.my_courses_page, "我的课程", FIF.ACCEPT)
+        # 页签切换 → 结果页按需刷新（置脏或从未加载过才拉取，见
+        # CourseResultPage.on_shown）；currentChanged 在页签填充期间也会发
+        # （首个 addPage），槽里对非结果页直接 no-op
+        self.tabs.stackedWidget.currentChanged.connect(self._on_tab_changed)
         self.stack.addWidget(self.tabs)
+
+    def _on_tab_changed(self, index):
+        """页签切换：当前页是结果页且置脏/从未加载过 → 触发一次加载。"""
+        app = self._app
+        if app is None:
+            return
+        widget = self.tabs.stackedWidget.widget(index)
+        for page in (app.my_courses_page, app.my_enroll_page):
+            if widget is page:
+                page.on_shown()
 
     def _build_placeholder_tabs(self):
         """占位页签（app is None 时保持构造可用）。"""

@@ -23,7 +23,10 @@
   课程页加载批次；启动自动登录（本地存了账号密码 → 工作线程完整登录一次）也由
   本层编排（``start_auto_login``），UI 反馈经 ``main_page``；
 - **账号菜单（MainPage 顶栏）**：退出登录 → 工作线程 ``client.logout()`` → 清会话
-  与账号密码 → 课程页清空 + 切回登录层；
+  （**账号记录保留**）→ 课程页清空 + 切回登录层；
+- **设置页**：MainPage 顶栏「设置」按钮（账号按钮右侧，未登录也可见）→
+  ``SettingsDialog``（``ui.settings``）编辑全局默认调度配置（新建任务默认值 +
+  调度器参数，本地读写无网络请求）；
 - **提示挂插件页**：跨页 InfoBar / 确认框一律挂 ``main_page``
   （``_info_parent``），绝不挂宿主主窗口；MainPage 未创建时（纯装配层测试）
   退回任务页自身；
@@ -57,8 +60,11 @@ from ..api import models
 from ..api.client import XkClient
 from . import state
 from .scheduler import GrabTask, TaskScheduler, TaskState
+from .settings import DEFAULTS, get_scheduler_config
 from ..ui.course import CoursePage
 from ..ui.favorites import FavoritesPage
+from ..ui.results import CourseResultPage
+from ..ui.settings import SettingsDialog
 from ..ui.tasks import TaskPage
 
 # 调度器状态 → 任务卡片状态文案（与 ui/tasks.py 的 clear_finished 判定一致）
@@ -153,6 +159,9 @@ class XkApp(QObject):
             self.client.set_credential_provider(
                 lambda: state.load_account(self._setting)
             )
+        # 多账号列表迁移：老设置（只有顶层 user/pwd）首次运行种子化 accounts
+        if self._setting is not None:
+            state.migrate_accounts(self._setting)
         self._fallback_pool = None
         # 插件主页面（MainPage）引用：MainPage 创建时经 attach_main_page 回填。
         # 跨页 InfoBar / 确认框都挂它（提示弹在插件页面上，不挂宿主主窗口）
@@ -171,12 +180,35 @@ class XkApp(QObject):
         self._logout_done = False
         self._close_filter = None
         self._about_to_quit_connected = False
-        self.scheduler = TaskScheduler(self.client, setting=setting, program=program)
+        # 全局令牌桶最小请求间隔（秒）：来自设置页（scheduler.min_interval），
+        # 无 setting（纯测试）时用出厂默认
+        if setting is not None:
+            min_interval = float(get_scheduler_config(setting)["min_interval"])
+        else:
+            min_interval = float(DEFAULTS["scheduler"]["min_interval"])
+        self.scheduler = TaskScheduler(
+            self.client, setting=setting, program=program,
+            min_interval=min_interval,
+        )
         self.course_page = CoursePage(
             client=self.client, setting=setting, program=program
         )
         self.favorites_page = FavoritesPage(
             client=self.client, setting=setting, program=program
+        )
+        # 选课结果两页（courseResult.do 抓包 [2]/[3]）：other="99"=我的课程
+        # （已选中，selectStatus 全 "99"）、other="01"=我的报名（报名/抽签队列，
+        # selectStatus 全 "01"）。两页行 canDelete=="1" 均可删除（我的课程页
+        # 显示「退选」、我的报名页显示「取消报名」，同一 delete_volunteer 流程）。
+        # 构造不自动加载：页签首次进入（MainPage.currentChanged → on_shown）
+        # 或手动刷新时才拉取。
+        self.my_courses_page = CourseResultPage(
+            client=self.client, setting=setting, program=program,
+            other="99", title="我的课程",
+        )
+        self.my_enroll_page = CourseResultPage(
+            client=self.client, setting=setting, program=program,
+            other="01", title="我的报名",
         )
         self.task_page = TaskPage(setting=setting)
         self._fallback_parent = None  # 无父窗口时给确认框用的隐藏占位
@@ -208,9 +240,12 @@ class XkApp(QObject):
         # 1b. 课程页单卡「立即报名」→ 单次提交，结果经 enrollFinished 回主线程
         self.course_page.enrollRequested.connect(self._on_enroll_requested)
         self.enrollFinished.connect(self._on_enroll_finished)
-        # 1c. 课程页/收藏页单卡「退选」→ 二次确认 → 单次退课，结果经 dropFinished
+        # 1c. 课程页/收藏页/结果页「退选」→ 二次确认 → 单次退课，结果经
+        # dropFinished（结果页卡片 from_result_row 自带 batch_code，同流程）
         self.course_page.dropRequested.connect(self._on_drop_requested)
         self.favorites_page.dropRequested.connect(self._on_drop_requested)
+        self.my_courses_page.dropRequested.connect(self._on_drop_requested)
+        self.my_enroll_page.dropRequested.connect(self._on_drop_requested)
         self.dropFinished.connect(self._on_drop_finished)
         # 2. 课程页收藏切换 → 刷新收藏页（state 写入由 CoursePage 完成）
         self.course_page.favoriteToggled.connect(self._on_course_favorite_toggled)
@@ -253,6 +288,13 @@ class XkApp(QObject):
         # 收藏页 Loading 遮罩挂 MainPage（覆盖整个插件页区域，不挂宿主窗口）
         self.favorites_page.set_main_page(page)
         self.course_page.loginRequired.connect(page.show_login_layer)
+        # 顶栏「设置」按钮（账号按钮右侧，未登录也可见）→ 打开设置弹窗
+        page.settingsRequested.connect(self._open_settings)
+
+    def _open_settings(self):
+        """打开设置对话框（挂 MainPage，绝不挂宿主窗口；本地读写无网络请求）。"""
+        dialog = SettingsDialog(setting=self._setting, parent=self._info_parent())
+        dialog.exec()
 
     def _on_login_card_finished(self, ok, msg):
         """登录卡登录成功（主线程）：进入页签层 + 账号按钮 + 加载批次。
@@ -285,7 +327,9 @@ class XkApp(QObject):
             return
         user, pwd = ("", "")
         if self._setting is not None:
-            user, pwd = state.load_account(self._setting)
+            # 多账号场景：自动登录**最近使用**的账号（accounts 列表按
+            # last_used 降序取首个；列表为空回退顶层键）
+            user, pwd = state.load_last_account(self._setting)
         if not user or not pwd:
             if self.main_page is not None:
                 self.main_page.show_login_layer()
@@ -402,13 +446,17 @@ class XkApp(QObject):
         )
 
     def _find_course(self, teaching_class_id):
-        """从课程页或收藏页卡片取 Course；两处都没有返回 None。"""
+        """从课程页/收藏页/两个结果页取 Course；都没有返回 None。"""
         card = self.course_page.cardGroup.getCard(teaching_class_id)
         if card is not None and card.course is not None:
             return card.course
         card = self.favorites_page.cardGroup.getCard(teaching_class_id)
         if card is not None and card.course is not None:
             return card.course
+        for page in (self.my_courses_page, self.my_enroll_page):
+            course = page.find_course(teaching_class_id)
+            if course is not None:
+                return course
         return None
 
     def _batch_begin_time(self, batch_code) -> str:
@@ -464,14 +512,19 @@ class XkApp(QObject):
         self._thread_pool().submit(self._enroll_worker, course)
 
     def _find_enroll_course(self, teaching_class_id):
-        """取报名所需 Course：先选课页当前列表，再退到本地收藏记录。
+        """取报名所需 Course：先选课页当前列表，再退到两个结果页与本地收藏记录。
 
-        两处都没有返回 ``None``（调用方弹「未找到课程信息」）。收藏记录是 dict，
+        顺序：选课页卡片 → 结果页已加载列表（我的课程 / 我的报名）→ 本地收藏。
+        都没有返回 ``None``（调用方弹「未找到课程信息」）。收藏记录是 dict，
         转成 ``models.Course`` 后与选课页卡片走同一条提交路径。
         """
         card = self.course_page.cardGroup.getCard(teaching_class_id)
         if card is not None and getattr(card, "course", None) is not None:
             return card.course
+        for page in (self.my_courses_page, self.my_enroll_page):
+            course = page.find_course(teaching_class_id)
+            if course is not None:
+                return course
         if self._setting is not None:
             for fav in state.list_favorites(self._setting):
                 if isinstance(fav, dict) and fav.get("teaching_class_id") == teaching_class_id:
@@ -587,6 +640,9 @@ class XkApp(QObject):
             self.favorites_page.refresh_list()
             # 与退选成功相同：重新查询当前类别，让卡片回到最新报名态
             self.course_page.reload_current_category()
+            # 报名成功后服务端选课结果变了：两个结果页置脏（页签再次进入时刷新）
+            self.my_courses_page.mark_stale()
+            self.my_enroll_page.mark_stale()
             logging.info(f"立即报名成功：{teaching_class_id}（{name}）")
             InfoBar.success(
                 title="报名成功",
@@ -755,6 +811,9 @@ class XkApp(QObject):
             self.favorites_page.refresh_list()
             # 重新查询当前类别：让卡片回到未报名态（隐藏「退选」、显示报名按钮）
             self.course_page.reload_current_category()
+            # 退选成功后服务端选课结果变了：两个结果页置脏（页签再次进入时刷新）
+            self.my_courses_page.mark_stale()
+            self.my_enroll_page.mark_stale()
             logging.info(f"退选成功：{teaching_class_id}（{name}）")
             InfoBar.success(
                 title="退选成功",
@@ -964,9 +1023,10 @@ class XkApp(QObject):
     def request_logout(self):
         """账号菜单「退出登录」→ 工作线程调 ``client.logout()``，结果经信号回主线程。
 
-        与关闭时自动登出（``logout_on_exit``）的区别：这里是**显式退出**，成功后
-        连本地保存的账号密码一起清掉，下次启动不应再自动登录。登出请求走工作
-        线程（网络 IO，不能卡 UI 线程），严禁在线程里碰 QWidget。
+        与关闭时自动登出（``logout_on_exit``）的区别：这里是**显式退出**，清掉
+        本地会话并回到登录层，但**账号记录保留**（多账号管理：账号密码留在
+        accounts 列表与顶层键，下次登录界面上仍可见、可一键回填或自动登录）。
+        登出请求走工作线程（网络 IO，不能卡 UI 线程），严禁在线程里碰 QWidget。
         """
         self._thread_pool().submit(self._account_logout_worker)
 
@@ -985,14 +1045,14 @@ class XkApp(QObject):
         self._logoutReady.emit()
 
     def _on_account_logout_ready(self):
-        """主线程：清会话与账号密码 → 课程页清空 + 切回登录层 → 弹提示。"""
+        """主线程：清会话（**账号记录保留**）→ 课程页清空 + 切回登录层 → 弹提示。"""
         if self._setting is not None:
             state.clear_session(self._setting)
-            # 显式退出 ≠ 关闭程序：清掉账号密码，下次启动不自动登录
-            state.save_account(self._setting, "", "")
+            # 显式退出 ≠ 删除账号：user/pwd 与 accounts 列表都保留（多账号
+            # 管理），用户回到登录界面可从「已保存的账号」一键回填重新登录
         self._clear_session_only()
         self._enter_logged_out()
-        logging.info("已退出登录并清除本地会话与保存的账号密码")
+        logging.info("已退出登录并清除本地会话（账号记录保留）")
         InfoBar.success(
             title="已退出登录",
             content="已清除本地会话与保存的账号密码",
@@ -1004,8 +1064,10 @@ class XkApp(QObject):
         )
 
     def _enter_logged_out(self):
-        """进入未登录态：课程页清空 + MainPage 切回登录层并隐藏账号按钮。"""
+        """进入未登录态：课程页/结果页清空 + MainPage 切回登录层并隐藏账号按钮。"""
         self.course_page.reset_to_login()
+        self.my_courses_page.clear_results()
+        self.my_enroll_page.clear_results()
         if self.main_page is not None:
             self.main_page.on_logged_out()
 

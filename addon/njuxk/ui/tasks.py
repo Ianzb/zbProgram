@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from qtpy.QtCore import Qt, Signal
 from qtpy.QtGui import QDoubleValidator, QIntValidator
-from qtpy.QtWidgets import QHBoxLayout, QVBoxLayout
+from qtpy.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget
 
 from qfluentwidgets import (
     BodyLabel,
@@ -34,6 +34,7 @@ from qfluentwidgets import (
     LineEdit,
     PrimaryPushButton,
     PushButton,
+    SmoothScrollArea,
     ToolButton,
 )
 
@@ -42,7 +43,7 @@ import zbWidgetLib as zbw
 from ..core import settings as core_settings
 from ..core import state
 from ..core.scheduler import TaskState
-from .layout import apply_card_margins, apply_page_margins
+from .layout import SPACING, apply_card_margins, apply_page_margins
 from .text_select import make_selectable
 
 
@@ -89,6 +90,9 @@ class TaskCard(zbw.CardWidget):
         self._delay_min = float(cfg.get("delay_min", 1.0))
         self._delay_max = float(cfg.get("delay_max", 2.0))
         self._repeat = int(cfg.get("repeat", 0))
+        # 新建卡片「定时开始」开关初始值来自全局默认配置（设置页可改）；
+        # 仅影响新建卡片的初始勾选态，创建后用户可随时用开关改（切换即生效）
+        self._initial_timed = bool(cfg.get("use_timed_start", True))
 
         self._build_ui()
         self._connect_signals()
@@ -113,9 +117,10 @@ class TaskCard(zbw.CardWidget):
 
         self.timerSwitch = zbw.SwitchButton(self)
         self.timerSwitch.setText("定时开始")
-        # 新建任务默认开启定时开始（2026-08-31 需求）：与 GrabTask 默认值一致。
-        # 此时 _connect_signals 尚未执行，不会误发 timedStartToggled 信号。
-        self.timerSwitch.setChecked(True)
+        # 新建任务默认值来自设置页（core.settings.scheduler.use_timed_start，
+        # 2026-08-31 需求默认 True）：此时 _connect_signals 尚未执行，
+        # 不会误发 timedStartToggled 信号。
+        self.timerSwitch.setChecked(getattr(self, "_initial_timed", True))
         self.beginTimeLabel = make_selectable(BodyLabel("批次开始：--", self))
         self.beginTimeLabel.setTextColor("#606060", "#d2d2d2")
 
@@ -425,8 +430,20 @@ class TaskCard(zbw.CardWidget):
         }
 
 
-class TaskPage(zbw.CardGroup):
-    """任务列表页：CardGroup 装 TaskCard，wid = teaching_class_id。
+class TaskPage(QWidget):
+    """任务列表页：滚动区里的 CardGroup 装 TaskCard，wid = teaching_class_id。
+
+    布局（用户要求「收藏和任务界面的顶栏也要固定」，对齐 ``ui/course.py``）：
+    本页**不再**继承 ``zbw.CardGroup``（其整页即列表，清空按钮行会跟着任务卡片
+    一起滚走），改为普通 ``QWidget`` 页根布局 + 内部唯一一个纵向
+    ``SmoothScrollArea``（``taskScroll``）——「一键清空」工具行固定在页根
+    （保持原位置：列表上方），只有任务卡片列表（innerGroup / emptyLabel）在
+    ``taskScroll`` 里滚动。``BasicTabPage.addPage`` 只要求 widget 本身，页签
+    行为不变。
+
+    **CardGroup 兼容**：本页对外仍被装配层/测试当作 CardGroup 使用（addCard /
+    clearCard / removeCard / count / getCards 等），这些 API 一律转发给滚动
+    内容里的 ``innerGroup``；``cardCountChanged`` 由 innerGroup 转发重发。
 
     信号：
         taskStartRequested(str) —— 转发自卡片
@@ -434,39 +451,141 @@ class TaskPage(zbw.CardGroup):
         taskRemoved(str)
         timedStartToggled(str, bool) —— 转发自卡片（定时开始开关切换）
         paramsChanged(str, dict)     —— 转发自卡片（延迟/重复次数改动）
+        cardCountChanged(int)        —— 转发自 innerGroup（卡片数量变化）
         clearAllRequested()          —— 「一键清空」二次确认后发出，
             由装配层执行（停止全部任务 + 调度器任务表清空 + 移除全部卡片）
 
     设置入口在 MainPage 顶栏的账号菜单里（原任务页「设置」按钮已移除）。
     """
 
+    # InfoBar / 对话框挂载标记：``ui/cards.py`` 的 ``_dialog_parent`` 沿 parent
+    # 链上溯找插件页面（原来只认 ``zbw.BasicTab``），本页改基类后靠此标记继续
+    # 被识别为插件页面 —— 弹窗遮罩仍覆盖整个任务页，绝不提升到宿主主窗口
+    _info_parent_flag = True
+
     taskStartRequested = Signal(str)
     taskStopRequested = Signal(str)
     taskRemoved = Signal(str)
     timedStartToggled = Signal(str, bool)
     paramsChanged = Signal(str, dict)
+    cardCountChanged = Signal(int)
     clearAllRequested = Signal()
 
     def __init__(self, setting=None, parent=None):
-        super().__init__(parent, show_title=False, is_v=True)
+        super().__init__(parent)
         self._setting = setting
+        self._clear_confirm_btn = None
+        self._clear_cancel_btn = None
+        self._build_ui()
+        # innerGroup 的计数变化 → 重发本页信号（驱动空态显隐 + 外部订阅者）
+        self.innerGroup.cardCountChanged.connect(self.cardCountChanged.emit)
+        self.innerGroup.cardCountChanged.connect(self._update_empty_visibility)
+
+    def _build_ui(self):
+        # 页根布局：工具行 + 任务列表滚动区（前者固定，后者滚动）。
         # 页面级边距/间距统一取自 ui.layout（与选课页、收藏页同一套常量）
-        apply_page_margins(self.boxLayout)
+        self.vBoxLayout = QVBoxLayout(self)
+        apply_page_margins(self.vBoxLayout)
+
         # 顶部工具行：「一键清空」（设置对话框已删除，这是清空任务的唯一入口）
+        # —— 固定在页根（保持原位置：列表上方），不随列表滚动
         toolRow = QHBoxLayout()
         toolRow.addStretch(1)
         self.clearAllButton = PushButton(FIF.DELETE, "一键清空", self)
         self.clearAllButton.setToolTip("停止并移除全部任务（含运行中）")
         self.clearAllButton.clicked.connect(self._on_clear_all_clicked)
         toolRow.addWidget(self.clearAllButton)
-        self.boxLayout.addLayout(toolRow)
-        self._clear_confirm_btn = None
-        self._clear_cancel_btn = None
-        self.emptyLabel = make_selectable(BodyLabel("暂无任务", self))
+        self.vBoxLayout.addLayout(toolRow)
+
+        # ---- 列表区：唯一纵向滚动区（顶栏固定在滚动内容之外）----
+        # 用户需求「收藏和任务界面的顶栏也要固定」：范式对齐 ui/course.py /
+        # ui/settings.py（SmoothScrollArea + widgetResizable + NoFrame + 透明背景）
+        self.taskScroll = SmoothScrollArea(self)
+        self.taskScroll.setWidgetResizable(True)
+        self.taskScroll.setFrameShape(QFrame.NoFrame)
+        self.taskScroll.enableTransparentBackground()
+
+        # 滚动内容容器：页面边距已由 apply_page_margins 提供，这里只留少量
+        # 上下边距（顶部与固定工具行拉开一点、底部留呼吸），左右为 0
+        inner = QWidget(self.taskScroll)
+        self.taskScroll.setWidget(inner)
+        # inner 必须显式透明：qfw enableTransparentBackground() 只给「当时已
+        # setWidget 的内容 widget」设透明样式（本页在其之前调用 → inner 拿不到）；
+        # 而宿主 FluentWindow 的 FLUENT_WINDOW qss 会层叠进页面，使 inner
+        # autoFillBackground=True 并涂上系统窗口色（亮 #efefef，暗色主题下与
+        # 页面背景形成大色块）。写法对齐旧版 zbw.BasicTab（BetterScrollArea.view）。
+        inner.setStyleSheet("QWidget {background-color: rgba(0,0,0,0); border: none}")
+        innerLayout = QVBoxLayout(inner)
+        innerLayout.setContentsMargins(0, 4, 0, 8)
+        innerLayout.setSpacing(SPACING)
+
+        # 任务卡片列表（在滚动内容里，自然高度不占 stretch）
+        self.innerGroup = zbw.CardGroup(inner, show_title=False, is_v=True)
+        innerLayout.addWidget(self.innerGroup)
+
+        self.emptyLabel = make_selectable(BodyLabel("暂无任务", inner))
         self.emptyLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.emptyLabel.setTextColor("#606060", "#d2d2d2")
-        self.boxLayout.addWidget(self.emptyLabel)
-        self.cardCountChanged.connect(self._update_empty_visibility)
+        innerLayout.addWidget(self.emptyLabel)
+
+        # 任务列表滚动区独占剩余纵向空间（stretch=1），工具行保持固有高度
+        self.vBoxLayout.addWidget(self.taskScroll, 1)
+
+    # ------------------------------------------------------------------
+    # CardGroup 兼容转发（外部仍把 TaskPage 当 CardGroup 使用）
+    # ------------------------------------------------------------------
+
+    @property
+    def boxLayout(self):
+        """兼容别名：历史上 TaskPage 是 CardGroup，``boxLayout`` 指列表布局；
+        现指向滚动内容里 innerGroup 的布局（无外部写引用，只读兜底）。"""
+        return self.innerGroup.boxLayout
+
+    def addCard(self, card, wid: str | int = None, pos: int = -1):
+        return self.innerGroup.addCard(card, wid, pos)
+
+    def addWidget(self, card, wid: str | int = None, pos: int = -1):
+        return self.innerGroup.addWidget(card, wid, pos)
+
+    def removeCard(self, wid: str | int):
+        return self.innerGroup.removeCard(wid)
+
+    def removeWidget(self, wid: int | str):
+        return self.innerGroup.removeWidget(wid)
+
+    def getCard(self, wid: str | int):
+        return self.innerGroup.getCard(wid)
+
+    def getWidget(self, wid: str | int):
+        return self.innerGroup.getWidget(wid)
+
+    def getCards(self):
+        return self.innerGroup.getCards()
+
+    def getWidgets(self):
+        return self.innerGroup.getWidgets()
+
+    def getWids(self):
+        return self.innerGroup.getWids()
+
+    def getCardMap(self):
+        return self.innerGroup.getCardMap()
+
+    def getWidgetMap(self):
+        return self.innerGroup.getWidgetMap()
+
+    def count(self):
+        return self.innerGroup.count()
+
+    def clearCard(self):
+        self.innerGroup.clearCard()
+
+    def clearWidget(self):
+        self.innerGroup.clearWidget()
+
+    # ------------------------------------------------------------------
+    # 任务增删
+    # ------------------------------------------------------------------
 
     def add_task(self, course, begin_time: str = "", config: dict = None) -> TaskCard:
         """新增任务卡片；同一 teaching_class_id 已存在时提示并返回已有卡片。"""

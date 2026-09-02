@@ -41,6 +41,11 @@ course_kind 补全：抓包 ``#24``（batch.do）的 ``limitMenuList`` 中 ``cou
 渲染卡片，**不发任何请求**；切换类别/搜索时保留筛选值；筛选后为空显示
 「当前筛选条件下暂无课程」。
 
+固定顶栏（用户要求「选课页面的顶栏要固定，不随页面滚动」）：工具行与类别区
+固定在页根布局，**只有**课程卡片列表在页内唯一的纵向滚动区（``cardScroll``）
+里滚动；本页因此不再继承 ``zbw.BasicTab``（其整页即滚动区），改为普通
+``QWidget``（详见 ``CoursePage`` 类注释与 ``ui/cards.py`` 的挂载标记约定）。
+
 布局紧凑（用户要求「不要一个组件一行」）：批次下拉、刷新批次、搜索框、校区
 筛选、刷新课程全部塞进**同一个工具行**；「刷新课程」放在工具行**最右**（与
 搜索/校区同侧），与「刷新批次」之间隔着可伸缩的搜索框，两个刷新不会并排紧挨
@@ -57,7 +62,9 @@ from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtWidgets import QSizePolicy
 from qtpy.QtCore import Qt, Signal
 from qtpy.QtWidgets import (
+    QFrame,
     QHBoxLayout,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -67,6 +74,7 @@ from qfluentwidgets import (
     FluentIcon as FIF,
     PushButton,
     ScrollArea,
+    SmoothScrollArea,
     ToolButton,
 )
 
@@ -82,6 +90,7 @@ from .layout import (
     BATCH_COMBO_MIN_WIDTH,
     CATEGORY_MIN_WIDTH,
     SEARCH_MIN_WIDTH,
+    SPACING,
     apply_page_margins,
     apply_tool_row,
 )
@@ -93,12 +102,46 @@ LOADING_WID = "__loading__"
 #: 校区筛选的「全部校区」选项（userData 为空串，表示不过滤）
 ALL_CAMPUSES = "全部校区"
 
+#: 类别 Tab 显示顺序（menuCode 列表，如 ``["GG02", "GG01", "ZY"]``）。
+#:
+#: 默认为用户指定的 8 类顺序：专业 → 研学/探讨/通识 → 科学之光 → 美育 → 公选 →
+#: 跨专业 → 体育 → 悦读。列表中的类别按此处顺序排在前面，常量**未收录**的类别
+#: 按服务端顺序追加在尾部（遗漏的 code 不丢失、不崩溃，如 TX01 大学数学）。
+#: 设为 ``[]`` 恢复「按服务端 limitMenuList 原顺序」。改动后重启宿主生效。
+CATEGORY_ORDER: list[str] = ["ZY", "GG02", "GG06", "MY", "GG01", "KZY", "TY", "YD"]
 
-class CoursePage(zbw.BasicTab):
+
+def _sort_menus_by_category_order(menus):
+    """按 ``CATEGORY_ORDER`` 常量重排类别菜单（常量为空 = 服务端原顺序）。
+
+    常量收录的 menuCode 按常量出现顺序排前面；未收录的按服务端顺序追加在
+    尾部——遗漏的 code 不丢失、不崩溃。
+    """
+    if not CATEGORY_ORDER:
+        return menus
+    rank = {code: i for i, code in enumerate(CATEGORY_ORDER)}
+    front = sorted(
+        (m for m in menus if m.menu_code in rank),
+        key=lambda m: rank[m.menu_code],
+    )
+    tail = [m for m in menus if m.menu_code not in rank]
+    return front + tail
+
+
+class CoursePage(QWidget):
     """选课页：批次 → 类别 → 课程列表（分页 + 搜索）。
 
     登录卡与账号按钮不在本页：登录层在 ``MainPage``（main.py），账号菜单在
     ``MainPage`` 顶栏。本页只负责已登录后的浏览（批次/类别/课程）。
+
+    布局（用户要求「顶栏要固定，不随页面滚动」）：本页**不再**继承
+    ``zbw.BasicTab``（BasicTab 整页就是一个纵向滚动区，工具行/类别区会跟着
+    课程卡片一起滚走），改为普通 ``QWidget`` 页根布局 + 内部唯一一个纵向
+    ``SmoothScrollArea``（``cardScroll``）—— 工具行（``toolRow``）与类别区
+    （``categoryScroll``）固定在页根，只有课程卡片列表（cardGroup /
+    emptyLabel / loadMoreButton）在 ``cardScroll`` 里滚动。
+    ``BasicTabPage.addPage`` 只要求 widget 本身，不要求 BasicTab 类型，页签
+    行为不变。
 
     信号：
         enrollRequested(str) —— 立即报名请求（teaching_class_id），转发自卡片
@@ -110,6 +153,11 @@ class CoursePage(zbw.BasicTab):
         loginRequired()      —— 会话失效且重新登录失败，请求切回登录层
             （由 MainPage 响应；本页不再内嵌登录卡）
     """
+
+    # InfoBar / 对话框挂载标记：``ui/cards.py`` 的 ``_dialog_parent`` 沿 parent
+    # 链上溯找插件页面（原来只认 ``zbw.BasicTab``），本页改基类后靠此标记继续
+    # 被识别为插件页面 —— 弹窗遮罩仍覆盖整个选课页，绝不提升到宿主主窗口
+    _info_parent_flag = True
 
     enrollRequested = Signal(str)
     grabRequested = Signal(str)
@@ -192,6 +240,8 @@ class CoursePage(zbw.BasicTab):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
+        # 页根布局：工具行 + 类别区 + 卡片滚动区（前三者/前者固定，最后者滚动）
+        self.vBoxLayout = QVBoxLayout(self)
         apply_page_margins(self.vBoxLayout)
 
         # ---- 工具行：批次下拉 + 刷新批次 + 搜索 + 校区 + 刷新课程（同一行）----
@@ -296,19 +346,47 @@ class CoursePage(zbw.BasicTab):
         self._sync_category_size()
         self.vBoxLayout.addWidget(self.categoryScroll)
 
-        # 列表区：CardGroup + 空结果 + 加载更多
-        self.cardGroup = zbw.CardGroup(self, show_title=False, is_v=True)
-        self.vBoxLayout.addWidget(self.cardGroup, 1)
+        # ---- 卡片区：唯一纵向滚动区（顶栏/类别区固定在滚动内容之外）----
+        # 用户需求「选课页面的顶栏要固定，不随页面滚动」：此前整页继承
+        # zbw.BasicTab（BetterScrollArea），工具行/类别区在滚动内容里跟着卡片
+        # 滚走。现在只有课程列表在 cardScroll 里滚动，范式对齐 ui/settings.py
+        # （SmoothScrollArea + widgetResizable + NoFrame + 透明背景）。
+        self.cardScroll = SmoothScrollArea(self)
+        self.cardScroll.setWidgetResizable(True)
+        self.cardScroll.setFrameShape(QFrame.NoFrame)
+        self.cardScroll.enableTransparentBackground()
 
-        self.emptyLabel = make_selectable(BodyLabel("暂无课程", self))
+        # 滚动内容容器：页面边距已由 apply_page_margins 提供，这里只留
+        # 少量上下边距（顶部与固定顶栏拉开一点、底部给加载更多按钮留呼吸），
+        # 左右为 0 —— 不再叠一层大边距
+        inner = QWidget(self.cardScroll)
+        self.cardScroll.setWidget(inner)
+        # inner 必须显式透明：qfw enableTransparentBackground() 只给「当时已
+        # setWidget 的内容 widget」设透明样式（本页在其之前调用 → inner 拿不到）；
+        # 而宿主 FluentWindow 的 FLUENT_WINDOW qss 会层叠进页面，使 inner
+        # autoFillBackground=True 并涂上系统窗口色（亮 #efefef，暗色主题下与
+        # 页面背景形成大色块）。写法对齐旧版 zbw.BasicTab（BetterScrollArea.view）。
+        inner.setStyleSheet("QWidget {background-color: rgba(0,0,0,0); border: none}")
+        innerLayout = QVBoxLayout(inner)
+        innerLayout.setContentsMargins(0, 4, 0, 8)
+        innerLayout.setSpacing(SPACING)
+
+        # 列表区：CardGroup + 空结果 + 加载更多（全在滚动内容里）
+        self.cardGroup = zbw.CardGroup(inner, show_title=False, is_v=True)
+        innerLayout.addWidget(self.cardGroup)
+
+        self.emptyLabel = make_selectable(BodyLabel("暂无课程", inner))
         self.emptyLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.emptyLabel.setTextColor("#606060", "#d2d2d2")
         self.emptyLabel.hide()
-        self.vBoxLayout.addWidget(self.emptyLabel)
+        innerLayout.addWidget(self.emptyLabel)
 
-        self.loadMoreButton = PushButton("加载更多", self)
+        self.loadMoreButton = PushButton("加载更多", inner)
         self.loadMoreButton.hide()
-        self.vBoxLayout.addWidget(self.loadMoreButton)
+        innerLayout.addWidget(self.loadMoreButton)
+
+        # 卡片滚动区独占剩余纵向空间（stretch=1），工具行/类别区保持固有高度
+        self.vBoxLayout.addWidget(self.cardScroll, 1)
 
     def _sync_category_size(self):
         """按类别项 sizeHint 同步滚动内容最小尺寸与滚动容器行高。
@@ -510,6 +588,8 @@ class CoursePage(zbw.BasicTab):
             if isinstance(m, dict)
         ]
         menus = models.filter_selectable_menus(menus)
+        # 类别 Tab 显示顺序：按 CATEGORY_ORDER 常量重排（常量为空 = 服务端原顺序）
+        menus = _sort_menus_by_category_order(menus)
         self._menus = menus
         self._current_menu = None
         self.categoryPivot.clear()
@@ -749,6 +829,7 @@ class CoursePage(zbw.BasicTab):
         tactic = self._current_batch_tactic_name()
         for course in self._filtered_courses():
             card = CourseCard(self)
+            card.client = self.client
             card.set_course(
                 course,
                 tactic,

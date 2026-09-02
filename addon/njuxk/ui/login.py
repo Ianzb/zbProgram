@@ -17,23 +17,27 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 from qtpy.QtCore import Qt, Signal
-from qtpy.QtWidgets import QVBoxLayout
+from qtpy.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from qfluentwidgets import (
     BodyLabel,
     CheckBox,
+    ComboBox,
     FluentIcon as FIF,
     InfoBar,
     InfoBarPosition,
     LineEdit,
+    MessageBox,
     PasswordLineEdit,
     PrimaryPushButton,
+    ToolButton,
 )
 
 import zbWidgetLib as zbw
 
 from ..api.client import XkClient
 from ..core import state
+from .layout import SPACING, TOOL_SPACING
 from .text_select import make_selectable
 
 
@@ -101,14 +105,34 @@ class LoginCard(zbw.HeaderCardWidget):
 
         self.loginButton.clicked.connect(self.do_login)
 
+        # 「已保存的账号」行（多账号管理）：下拉选择 + 永久删除，一行紧凑排布；
+        # 列表为空时整行隐藏（不占位）
+        self.accountsRow = QWidget(self)
+        rowLayout = QHBoxLayout(self.accountsRow)
+        rowLayout.setContentsMargins(0, 0, 0, 0)
+        rowLayout.setSpacing(TOOL_SPACING)
+        self.accountCombo = ComboBox(self.accountsRow)
+        self.accountCombo.setPlaceholderText("选择已保存的账号")
+        self.deleteAccountButton = ToolButton(FIF.DELETE, self.accountsRow)
+        self.deleteAccountButton.setToolTip("永久删除当前选中的账号")
+        self.deleteAccountButton.setEnabled(False)
+        rowLayout.addWidget(self.accountCombo, 1)
+        rowLayout.addWidget(self.deleteAccountButton)
+        self.accountsRow.setVisible(False)
+        self._cached_accounts = []
+        self.accountCombo.currentIndexChanged.connect(self._on_account_selected)
+        self.deleteAccountButton.clicked.connect(self._delete_selected_account)
+
         self.formLayout = QVBoxLayout()
-        self.formLayout.setSpacing(12)
+        self.formLayout.setSpacing(SPACING)
+        self.formLayout.addWidget(self.accountsRow)
         self.formLayout.addWidget(self.userEdit)
         self.formLayout.addWidget(self.pwdEdit)
         self.formLayout.addWidget(self.rememberCheck)
         self.formLayout.addWidget(self.loginButton)
         self.formLayout.addWidget(self.statusLabel)
         self.viewLayout.addLayout(self.formLayout)
+        self.refresh_accounts()
 
     # ------------------------------------------------------------------
     # program / setting 兜底
@@ -163,6 +187,99 @@ class LoginCard(zbw.HeaderCardWidget):
             self._loading_box = None
         self.loginButton.setEnabled(True)
         self.statusLabel.setText("")
+
+    # ------------------------------------------------------------------
+    # 已保存的账号（多账号管理）
+    # ------------------------------------------------------------------
+
+    def refresh_accounts(self):
+        """重建「已保存的账号」下拉项；列表为空时整行隐藏（不占位）。
+
+        时机：登录卡构造时、登录成功后（新账号已 upsert 进列表）、删除后。
+        填充期间屏蔽信号：避免重建下拉项时逐项触发 ``_on_account_selected``
+        把表单回填成第一个账号（并误启用删除按钮）；重建后一律回到占位项。
+        """
+        accounts = []
+        setting = self.setting
+        if setting is not None:
+            accounts = state.list_accounts(setting)
+        self._cached_accounts = accounts
+        self.accountsRow.setVisible(bool(accounts))
+        self.accountCombo.blockSignals(True)
+        self.accountCombo.clear()
+        # 首项占位：userData 为空，选中它表示「手动输入」，不清表单
+        self.accountCombo.addItem("手动输入", userData="")
+        for acc in accounts:
+            user = acc["user"]
+            pwd = acc.get("pwd", "")
+            self.accountCombo.addItem(
+                f"{user}（{'已存密码' if pwd else '未存密码'}）", userData=user
+            )
+        self.accountCombo.setCurrentIndex(0)
+        self.accountCombo.blockSignals(False)
+        self.deleteAccountButton.setEnabled(False)
+
+    def _pwd_of(self, user):
+        """从缓存的账号列表里取该学号已保存的密码（未存返回空串）。"""
+        for acc in self._cached_accounts:
+            if acc["user"] == user:
+                return acc.get("pwd", "")
+        return ""
+
+    def _on_account_selected(self, index):
+        """下拉选中变化：选中具体账号 → 回填表单（不自动登录）；占位项不动表单。"""
+        user = self.accountCombo.itemData(index)
+        if not user:
+            # 占位项「手动输入」：保留用户正在输入的内容，只禁用删除按钮
+            self.deleteAccountButton.setEnabled(False)
+            return
+        self.deleteAccountButton.setEnabled(True)
+        self._fill_account(user, self._pwd_of(user))
+
+    def _fill_account(self, user, pwd):
+        """选中账号：回填表单（不自动登录）。
+
+        有存密码 → 填学号密码并勾选「记住密码」；未存密码 → 只填学号、
+        聚焦密码框让用户输入。
+        """
+        self.userEdit.setText(user)
+        if pwd:
+            self.pwdEdit.setText(pwd)
+            self.rememberCheck.setChecked(True)
+        else:
+            self.pwdEdit.clear()
+            self.pwdEdit.setFocus()
+
+    def _delete_selected_account(self):
+        """删除当前选中的账号：二次确认（永久删除，不可恢复）→ 删存储 → 刷新下拉。
+
+        只动本地存储，不碰当前会话；删空后整行隐藏。
+        """
+        user = self.accountCombo.currentData()
+        if not user:
+            return
+        box = MessageBox(
+            "确认删除？",
+            f"将永久删除账号 {user} 的保存记录\n此操作不可恢复",
+            self,
+        )
+        box.yesButton.setText("永久删除")
+        box.cancelButton.setText("取消")
+        if box.exec() != MessageBox.Accepted:
+            return
+        setting = self.setting
+        if setting is not None:
+            state.delete_account(setting, user)
+        self.refresh_accounts()
+        InfoBar.warning(
+            title="已删除",
+            content=f"账号 {user} 的保存记录已永久删除",
+            orient=Qt.Orientation.Vertical,
+            isClosable=True,
+            duration=3000,
+            position=InfoBarPosition.TOP_RIGHT,
+            parent=self,
+        )
 
     # ------------------------------------------------------------------
     # 登录流程
@@ -228,6 +345,8 @@ class LoginCard(zbw.HeaderCardWidget):
         else:
             logging.info(f"登录卡登录失败：{msg}")
         if ok:
+            # 新账号已 upsert 进 accounts 列表 → 刷新，下次回到登录层可见
+            self.refresh_accounts()
             # 明确提示：标题「登录成功」，内容含学号（拿不到学号时退为「已登录」）
             detail = msg or "已登录"
             student_code = getattr(self.client, "student_code", "")

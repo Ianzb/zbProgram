@@ -30,6 +30,27 @@ def _s(value: Any) -> str:
     return str(value)
 
 
+def _kind_str(value: Any, _depth: int = 0) -> str:
+    """courseKind 专用字符串化：**绝不**让整坨 dict 流入展示/提交链路。
+
+    用户实测：某些来源的 ``courseKind`` 值本身是**嵌套菜单对象**（dict），此前
+    多处用 ``_s()`` 直接字符串化，整坨 ``{'grade': None, ...}`` 文本经
+    ``Menu.course_kind`` → ``Course.course_kind`` 渲染进弹窗「课程类别」行。
+    规则（宁缺勿滥）：
+    - str → 原样（去首尾空格）；
+    - dict → 递归取其 ``"courseKind"`` 字段；dict 里也没有 → ``""``；
+    - None / 其他类型 → ``""``（不 ``str()``，防 int/对象泄漏）。
+    ``_depth`` 防自引用 dict 无限递归（超过 5 层按脏值丢弃）。
+    """
+    if _depth > 5:
+        return ""
+    if isinstance(value, dict):
+        return _kind_str(value.get("courseKind"), _depth + 1)
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
 # 类别代码 → 中文名静态映射（teachingClassType → 类别名）。
 #
 # 来源：参考脚本 ``NJU-xk-helper/README.md`` 的「courseKind（jxblx）对照表」
@@ -108,6 +129,17 @@ class Course:
     hours: str = ""
     kcjj: str = ""
     batch_code: str = ""
+    # 选课结果行（courseResult.do，抓包 [2]/[3]）附加字段；其余解析器不填，
+    # 保持默认空串（不影响既有构造 / 测试 / 收藏记录兼容）
+    #: 备注（服务端 ``extInfo``，如「请选课学生加入QQ群：364878154」，可为多行
+    #: 长通知），``extInfo`` 为空回落 ``comment``；``comment`` 非 str 脏值吞为空串
+    remark: str = ""
+    #: 是否可退选（服务端 ``canDelete``："1"/"0"）
+    can_delete: str = ""
+    #: 类别显示名：结果行 ``kclx``（如「体育」「专业平台」），空时回落到
+    #: ``MENU_CODE_NAMES.get(teachingClassType, teachingClassType)``（见
+    #: :func:`from_result_row`）
+    category_name: str = ""
 
 
 @dataclass
@@ -146,7 +178,8 @@ def from_public_course(
     """解析 ``publicCourse.do`` 的扁平行（抓包 ``#41``）。
 
     ``course_kind`` / ``teaching_class_type`` / ``batch_code`` 由外部注入，
-    不从课程行读取（课程行自身的 ``courseKind`` 与所选菜单值可能不一致）。
+    不从课程行读取（课程行自身的 ``courseKind`` 与所选菜单值可能不一致）；
+    注入值过 ``_kind_str``（防上游 dict 脏值，见 :func:`_kind_str`）。
     """
     return Course(
         teaching_class_id=_s(row.get("teachingClassID")),
@@ -161,7 +194,7 @@ def from_public_course(
         number_of_first_volunteer=_s(row.get("numberOfFirstVolunteer")),
         is_full=_s(row.get("isFull")),
         is_choose=_s(row.get("isChoose")),
-        course_kind=_s(course_kind),
+        course_kind=_kind_str(course_kind),
         teaching_class_type=_s(teaching_class_type),
         elective_type=_s(row.get("electiveType")),
         hours=_s(row.get("hours")),
@@ -200,12 +233,72 @@ def from_program_course(
         number_of_first_volunteer=_s(tc.get("numberOfFirstVolunteer")),
         is_full=_s(tc.get("isFull")),
         is_choose=_s(tc.get("isChoose")),
-        course_kind=_s(course_kind),
+        course_kind=_kind_str(course_kind),
         teaching_class_type=_s(teaching_class_type),
         elective_type=_s(tc.get("electiveType")),
         hours=_s(course_row.get("hours")),
         kcjj=_s(course_row.get("kcjj")),
         batch_code=_s(batch_code),
+    )
+
+
+def from_result_row(
+        row: Dict[str, Any],
+        batch_code: str,
+) -> Course:
+    """解析 ``courseResult.do`` 的单行（抓包 ``[2]`` 我的报名 / ``[3]`` 我的课程）。
+
+    与 ``from_public_course`` 的差异（结果行字段集不同）：
+    - ``selectStatus``（"99"=已选中 / "01"=报名队列）映射 ``is_choose``（仅
+      "99" 记 "1"，报名队列尚未选中不记）；
+    - ``remark`` 取 ``extInfo``（抓包 [2]/[3] 实证：备注承载字段是 ``extInfo``
+      ——单行如「请选课学生加入QQ群：364878154」，也可是含换行的多行长通知，
+      两份抓包里 ``comment`` 全为 null）；``extInfo`` 为空时回落 ``comment``
+      （防御：两字段都可能承载备注）；``comment`` 非 str 的脏值一律吞为空串
+      （个别批次可能下发「让报名的人加QQ群XXX」这类文案，绝不让 dict/int
+      流进展示层，也严禁写日志）；
+    - ``can_delete`` 取 ``canDelete``（"1" 才显示「退选」）；
+    - ``category_name`` 取 ``kclx``（如「体育」「专业平台」）；``[3]`` 里该值
+      可能为**空串**，此时回落 ``MENU_CODE_NAMES.get(teachingClassType,
+      teachingClassType)``（未收录的 code 原样展示，不编造中文名）；
+    - ``numberOfFirstVolunteer`` 在 ``[3]`` 里是**「已满」这类字符串**：原样
+      存入 ``number_of_first_volunteer`` 即可不崩（结果卡片不做概率计算，
+      不参与任何数值分支）；
+    - 结果行没有 ``numberOfSelected`` / ``kcjj``，保持默认空串。
+    """
+    teaching_class_type = _s(row.get("teachingClassType"))
+    kclx = _s(row.get("kclx")).strip()
+    category = kclx or MENU_CODE_NAMES.get(teaching_class_type, teaching_class_type)
+    # 备注：extInfo 优先（抓包实证的承载字段），为空回落 comment；
+    # comment 非 str 脏值吞为空串（extInfo 走 _s，任意值安全字符串化）
+    remark = _s(row.get("extInfo")).strip()
+    if not remark:
+        comment = row.get("comment")
+        if isinstance(comment, str):
+            remark = comment.strip()
+    return Course(
+        teaching_class_id=_s(row.get("teachingClassID")),
+        course_number=_s(row.get("courseNumber")),
+        course_name=_s(row.get("courseName")),
+        credit=_s(row.get("credit")),
+        teacher_name=_s(row.get("teacherName")),
+        teaching_place=_s(row.get("teachingPlace")),
+        campus_name=_s(row.get("campusName")),
+        class_capacity=_s(row.get("classCapacity")),
+        number_of_selected=_s(row.get("numberOfSelected")),
+        # 「已满」这类字符串原样透传（不参与数值计算，见 docstring）
+        number_of_first_volunteer=_s(row.get("numberOfFirstVolunteer")),
+        is_full=_s(row.get("isFull")),
+        is_choose="1" if _s(row.get("selectStatus")) == "99" else "",
+        course_kind=_kind_str(row.get("courseKind")),
+        teaching_class_type=teaching_class_type,
+        elective_type=_s(row.get("electiveType")),
+        hours=_s(row.get("hours")),
+        kcjj=_s(row.get("kcjj")),
+        batch_code=_s(batch_code),
+        remark=remark,
+        can_delete=_s(row.get("canDelete")),
+        category_name=category,
     )
 
 
@@ -224,11 +317,15 @@ def parse_batch(batch_dict: Dict[str, Any]) -> Batch:
 
 
 def parse_menu(menu_dict: Dict[str, Any]) -> Menu:
-    """解析 ``limitMenuList`` 中的单个菜单项。"""
+    """解析 ``limitMenuList`` 中的单个菜单项。
+
+    ``courseKind`` 走 ``_kind_str``：用户实测某些来源的该值本身是嵌套菜单
+    dict，直接 ``_s()`` 会把整坨 dict 文本流进 ``Menu.course_kind``。
+    """
     return Menu(
         menu_code=_s(menu_dict.get("menuCode")),
         menu_name=_s(menu_dict.get("menuName")),
-        course_kind=_s(menu_dict.get("courseKind")),
+        course_kind=_kind_str(menu_dict.get("courseKind")),
         limit_volunteer=_s(menu_dict.get("limitVolunteer")),
         is_open=_s(menu_dict.get("isopen")),
         is_allow_select=_s(menu_dict.get("isAllowSelect")),
@@ -270,7 +367,8 @@ def _menu_kind_pairs(menu_list: Any) -> Dict[str, str]:
         if not isinstance(item, dict):
             continue
         code = _s(item.get("menuCode"))
-        kind = _s(item.get("courseKind"))
+        # courseKind 可能是嵌套菜单 dict（用户实测）→ 走 _kind_str 防整坨入 map
+        kind = _kind_str(item.get("courseKind"))
         if not code or not kind or kind == "-":
             continue
         pairs[code] = kind
@@ -315,7 +413,8 @@ def build_course_kind_map(client, batch_limit_menu_list=None) -> Dict[str, str]:
         menu_map = data.get("menuMap") or {}
         if isinstance(menu_map, dict):
             for code, kind in menu_map.items():
-                code_s, kind_s = _s(code), _s(kind)
+                # menuMap 值同样可能是嵌套菜单 dict（用户实测）→ 走 _kind_str
+                code_s, kind_s = _s(code), _kind_str(kind)
                 if code_s and kind_s and kind_s != "-":
                     mapping[code_s] = kind_s
     except Exception as e:
