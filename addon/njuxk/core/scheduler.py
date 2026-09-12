@@ -48,6 +48,12 @@ logger = logging.getLogger(__name__)
 # 与参考脚本 xk_quick.py 对齐的速率控制常量
 MIN_INTERVAL = 0.35  # 全局最小请求间隔(秒)，约 2.8 req/s
 
+# 「余量检测发现有名额」→ 发起抢课请求之间的随机等待区间（秒）。
+# 检测到余量后**不立即**抢，也不套用令牌桶那个统一的最小间隔，而是随机等
+# 0.5~1.0s 再发 volunteer：每次等待值都不同，避免固定请求节奏被识别。
+SEAT_FOUND_DELAY_MIN = 0.5
+SEAT_FOUND_DELAY_MAX = 1.0
+
 # 「选课数量过多」类提示 → **立即终态失败，不再重试**。
 #
 # 这类提示是**账户级**限选（本轮次/本类别可选门数已用完），重试既不可能成功，
@@ -798,7 +804,15 @@ class TaskScheduler(QObject):
                 self.taskMessage.emit(tid, task.last_msg)
                 return "wait", task.last_msg
             if seats is not None:
-                logger.debug("余量=%d: tid=%s", seats, tid)
+                # 发现余量：随机等待 0.5~1.0s 再抢（不用统一延迟数值）
+                delay = random.uniform(SEAT_FOUND_DELAY_MIN, SEAT_FOUND_DELAY_MAX)
+                logger.debug(
+                    "发现余量=%d，随机等待 %.2fs 后抢课: tid=%s 第%d次尝试",
+                    seats, delay, tid, attempt_no,
+                )
+                self._sleep_interruptible(tid, delay)
+                if self._is_stopped(tid):
+                    return "stopped", "已停止"
             if task.course_number:
                 # 余量查询已消耗一次请求：再取一次令牌，保证 volunteer 与
                 # 查询之间间隔 ≥ min_interval（限速不因多一次查询而漏算）

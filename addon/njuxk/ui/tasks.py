@@ -118,7 +118,10 @@ class TaskCard(zbw.CardWidget):
         self.progressBar = zbw.CustomProgressBar(self, useAni=False, indeterminate=False)
 
         self.timerSwitch = zbw.SwitchButton(self)
-        self.timerSwitch.setText("定时开始")
+        # 开关前加功能文本（开关本身不再显示 On/Off 文案）
+        self.timerSwitch.setOnText("")
+        self.timerSwitch.setOffText("")
+        self.timerLabel = make_selectable(BodyLabel("定时开始抢课", self))
         # 新建任务默认值来自设置页（core.settings.scheduler.use_timed_start，
         # 2026-08-31 需求默认 True）：此时 _connect_signals 尚未执行，
         # 不会误发 timedStartToggled 信号。
@@ -162,6 +165,7 @@ class TaskCard(zbw.CardWidget):
 
         # 第三行：定时开始开关 + 批次开始时间
         row3 = QHBoxLayout()
+        row3.addWidget(self.timerLabel)
         row3.addWidget(self.timerSwitch)
         row3.addWidget(self.beginTimeLabel, 1)
         row3.addWidget(self.requestStatsLabel)

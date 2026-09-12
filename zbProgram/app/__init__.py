@@ -141,8 +141,10 @@ class Window(zbw.Window):
         """
         try:
             lib = None
+            # 是否为重装/更新：安装前该插件已在运行（程序启动时首次加载则不在）
+            reinstalled = info.get("id") in addonManager.ADDON_OBJECT
             # 卸载已安装插件
-            if info.get("id") in addonManager.ADDON_OBJECT:
+            if reinstalled:
                 lib = addonManager.ADDON_OBJECT.pop(info.get("id"), None)
                 main_page = addonManager.ADDON_MAIN_PAGE.pop(info.get("id"), None)
                 old_info = lib.addonBase.addon_info
@@ -167,6 +169,19 @@ class Window(zbw.Window):
             self.infoBar = InfoBar(InfoBarIcon.SUCCESS, "提示", f"插件{info.get("name")}安装成功！", Qt.Orientation.Vertical, True, 5000, InfoBarPosition.TOP_RIGHT, self.mainPage)
             self.infoBar.show()
             logging.info(f"插件{info.get("name")}安装成功")
+
+            # 重装/更新后需重启程序才能完全生效：对所有插件统一提示重启
+            if reinstalled:
+                box = MessageBox(
+                    "插件已更新",
+                    f"插件「{info.get('name', info.get('id', '未知插件'))}」已重新安装或更新，"
+                    "需重启程序才能完全生效。\n是否现在重启？",
+                    self,
+                )
+                box.yesButton.setText("重启程序")
+                box.cancelButton.setText("稍后")
+                if box.exec() == MessageBox.Accepted:
+                    program.restart()
         except:
             if info.get("api_version", 0) == program.ADDON_API_VERSION:
                 self.infoBar = InfoBar(InfoBarIcon.ERROR, "错误", f"插件{info.get("name")}安装失败！", Qt.Orientation.Vertical, True, 10000, InfoBarPosition.TOP_RIGHT, self.mainPage)
