@@ -33,8 +33,8 @@ class Program:
     """
     NAME = "zb小程序"  # 程序名称
     PROJECT_NAME = "zbProgram"  # 项目名称
-    VERSION = "5.12.0"  # 程序版本
-    VERSION_CODE = 72  # 版本序数
+    VERSION = "5.12.1"  # 程序版本
+    VERSION_CODE = 73  # 版本序数
     ADDON_API_VERSION = 9  # 插件版本序数
     CORE_VERSION = "5.7.2"  # 内核版本
     TITLE = f"{NAME} {VERSION}"  # 程序标题
