@@ -17,7 +17,8 @@ DEFAULTS = {
         # get_scheduler_config 的迁移逻辑自动升级，见 _OLD_DELAY_DEFAULTS）
         "delay_min": 1.0,
         "delay_max": 2.0,
-        "repeat": 0,
+        # 每轮最大请求次数（抢课请求 + 余量检测合计）；0 = 不限次数
+        "repeat": 100,
         # 新建任务默认开启定时开始（2026-08-31 需求，设置页可改）
         "use_timed_start": True,
         "max_workers": 3,
@@ -28,6 +29,8 @@ DEFAULTS = {
     },
     "selected_batch": "",
     "selected_category": "",
+    # 课程红黑榜（NJU-Hub 公共评价库）本地缓存：{"timestamp": int, "raw": {...}}
+    "ratings_cache": {},
 }
 
 
@@ -47,7 +50,7 @@ def _coerce(value, default, cast):
 _SCHEDULER_NUMERIC = {
     "delay_min": (1.0, float),
     "delay_max": (2.0, float),
-    "repeat": (0, _to_int),
+    "repeat": (100, _to_int),
     "max_workers": (3, _to_int),
     "min_interval": (0.35, float),
     "qos_backoff_base": (3.0, float),

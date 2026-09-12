@@ -66,9 +66,13 @@ SEARCH_MIN_WIDTH = 180
 LOGIN_CARD_MAX_WIDTH = 560
 
 
-def apply_page_margins(layout: QLayout) -> QLayout:
-    """把页面级外边距与间距套到 ``layout`` 上（返回同一对象便于链式调用）。"""
-    layout.setContentsMargins(MARGIN, MARGIN_TOP, MARGIN, MARGIN)
+def apply_page_margins(layout: QLayout, bottom: int = MARGIN) -> QLayout:
+    """把页面级外边距与间距套到 ``layout`` 上（返回同一对象便于链式调用）。
+
+    ``bottom`` 默认 ``MARGIN``；**滚动列表页**传 ``0``，使列表滚动到窗口最下方
+    时不再有底部留白（需求「所有滚动页面到窗口下方的边距改成 0」）。
+    """
+    layout.setContentsMargins(MARGIN, MARGIN_TOP, MARGIN, bottom)
     layout.setSpacing(SPACING)
     return layout
 

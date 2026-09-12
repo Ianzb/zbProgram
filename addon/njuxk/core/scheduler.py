@@ -21,9 +21,10 @@
 立即打断睡眠。
 
 语义约定（已与用户确认）：``repeat=0`` 表示不限次数（成功即停）；``repeat>0``
-表示**每轮**最大尝试次数（``start()`` 重启即开启新一轮）；**成功即停**与重复次数
-无关。``attempts`` 是累计值，重启**不归零**（继续计数），``attempts_base`` 记录
-本轮起点；若要从头开始，调用方应先 ``remove()`` 再 ``add_task()``。
+表示**每轮**最大**总请求数**（抢课请求 ``attempts`` + 余量检测 ``seat_checks``，
+``start()`` 重启即开启新一轮）；**成功即停**与重复次数无关。计数是累计值，重启
+**不归零**（继续计数），``attempts_base`` 记录本轮起点总请求数；若要从头开始，
+调用方应先 ``remove()`` 再 ``add_task()``。
 """
 from __future__ import annotations
 
@@ -38,6 +39,7 @@ from typing import Any, Dict, Optional
 
 from qtpy.QtCore import QCoreApplication, QObject, QTimer, Signal
 
+from ..api import models
 from . import settings as core_settings
 from . import state
 
@@ -129,6 +131,7 @@ class GrabTask:
 
     teaching_class_id: str
     course_name: str = ""
+    course_number: str = ""
     course_kind: str = ""
     teaching_class_type: str = ""
     batch_code: str = ""
@@ -137,14 +140,23 @@ class GrabTask:
     end_time: str = ""
     delay_min: float = 1.0
     delay_max: float = 2.0
-    repeat: int = 0
+    repeat: int = 100
     # 新建任务默认开启定时开始（2026-08-31 需求）：批次 begin_time 在未来 →
     # 进倒计时；已过 → start() 立即开抢（_dispatch 语义不变）
     use_timed_start: bool = True
     state: str = TaskState.WAITING
+    #: 抢课请求次数（每次真正发 volunteer +1；首抢也计入）
     attempts: int = 0
-    attempts_base: int = 0  # 本轮起始尝试次数（start() 重启时置为当前 attempts）
+    #: 本轮起始**总请求数**（抢课请求 + 余量检测；start() 重启时置为当前总数）
+    attempts_base: int = 0
+    #: 余量检测次数（每次真正发起余量查询 +1；开始时的无条件首抢不计）
+    seat_checks: int = 0
     last_msg: str = ""
+
+    @property
+    def total_requests(self) -> int:
+        """总请求数 = 抢课请求（``attempts``）+ 余量检测（``seat_checks``）。"""
+        return self.attempts + self.seat_checks
 
     def should_skip(self) -> bool:
         """已在课表（``is_choose=="1"``）视为已完成，不发起请求。"""
@@ -158,6 +170,11 @@ class _RateLimiter:
         self._min_interval = min_interval
         self._lock = threading.Lock()
         self._last_time = 0.0
+
+    def set_min_interval(self, min_interval: float) -> None:
+        """即时更新最小请求间隔（设置页改动后立即生效，无需重启任务）。"""
+        with self._lock:
+            self._min_interval = max(0.0, float(min_interval))
 
     def acquire(self) -> float:
         """等待到可发下一个请求，返回实际等待秒数（供日志记录）。"""
@@ -175,6 +192,7 @@ class TaskScheduler(QObject):
 
     taskStateChanged = Signal(str, str)  # (teaching_class_id, state)
     taskProgress = Signal(str, int, int)  # (teaching_class_id, attempts, repeat)
+    taskSeatCheck = Signal(str, int)  # (teaching_class_id, seat_checks)
     taskMessage = Signal(str, str)  # (teaching_class_id, msg)
     taskFinished = Signal(str, bool, str)  # (teaching_class_id, ok, msg)
 
@@ -216,6 +234,49 @@ class TaskScheduler(QObject):
             return state.load_scheduler_config(self._setting)
         return dict(core_settings.DEFAULTS["scheduler"])
 
+    def reload_config(self) -> dict:
+        """重新读取本地调度配置并**即时应用**（设置页保存后由装配层调用）。
+
+        - ``min_interval``：立即写入令牌桶，后续请求即按新间隔限速；
+        - ``qos_backoff_base`` / ``qos_backoff_max``：立即更新，下一次 QoS 退避生效；
+        - ``max_workers``：重建插件自有线程池（旧池 ``shutdown(wait=False)``，
+          在跑的任务自然跑完，新提交走新池）；
+        - ``delay_*`` / ``repeat`` / ``use_timed_start``：属任务级参数，不在此处
+          覆盖运行中的任务（由任务卡片 ``paramsChanged`` 即时同步）。
+
+        返回归一化后的配置 dict（便于测试断言）。
+        """
+        cfg = self._load_config()
+        with self._lock:
+            self._qos_backoff_base = float(cfg.get("qos_backoff_base", 3.0))
+            self._qos_backoff_max = float(cfg.get("qos_backoff_max", 15.0))
+            self._min_interval = max(
+                0.0, float(cfg.get("min_interval", MIN_INTERVAL))
+            )
+        self._rate_limiter.set_min_interval(self._min_interval)
+        desired = max(1, int(cfg.get("max_workers", 3)))
+        if desired != self._max_workers:
+            self._recreate_pool(desired)
+        logger.info(
+            "调度配置已即时重载：并发=%d 最小间隔=%.2fs QoS基数=%.1fs 上限=%.1fs",
+            self._max_workers, self._min_interval,
+            self._qos_backoff_base, self._qos_backoff_max,
+        )
+        return cfg
+
+    def _recreate_pool(self, max_workers: int) -> None:
+        """重建插件自有线程池（``max_workers`` 动态调整用）。"""
+        old_pool = self._pool
+        self._max_workers = max(1, int(max_workers))
+        self._pool = ThreadPoolExecutor(
+            max_workers=self._max_workers, thread_name_prefix="nju-xk-grab"
+        )
+        if old_pool is not None:
+            try:
+                old_pool.shutdown(wait=False)
+            except Exception as e:  # noqa: BLE001 - 旧池关闭失败不影响新池
+                logger.debug("关闭旧线程池失败：%s", e)
+
     # ------------------------------------------------------------------
     # 任务表管理
     # ------------------------------------------------------------------
@@ -234,6 +295,7 @@ class TaskScheduler(QObject):
         task.state = TaskState.WAITING
         task.attempts = 0
         task.attempts_base = 0
+        task.seat_checks = 0
         task.last_msg = ""
         self.taskStateChanged.emit(tid, TaskState.WAITING)
         return True
@@ -300,7 +362,7 @@ class TaskScheduler(QObject):
                     event = self._stop_events.get(teaching_class_id)
                     if event is not None:
                         event.clear()
-                    task.attempts_base = task.attempts
+                    task.attempts_base = task.total_requests
                     task.state = TaskState.WAITING
                 self._submitted[teaching_class_id] = True
         if blocked_by_success:
@@ -600,6 +662,10 @@ class TaskScheduler(QObject):
             bool(task.use_timed_start), task.repeat,
         )
         qos_hit_count = 0
+        # 开始任务时**先无条件发一次抢课申请**（跳过余量检测）：抽课（随机分配）
+        # 的报名靠这一次请求完成，抢课课程也借此立即抢一次；之后进入循环按余量
+        # 检测 + 重试的抢课逻辑继续。两种模式因此共用同一套逻辑，无需预先判断。
+        first_attempt = True
         while True:
             # 停止检查（每次尝试前）
             if self._is_stopped(tid):
@@ -617,22 +683,28 @@ class TaskScheduler(QObject):
                 )
                 self._finish(task, TaskState.SUCCESS, True, "已在课表中")
                 return
-            # 重复次数检查（repeat 表示「每轮」次数，attempts_base 为本轮起点）
-            if task.repeat > 0 and task.attempts - task.attempts_base >= task.repeat:
+            # 重复次数检查（repeat 表示「每轮」**总请求数**上限：抢课请求 +
+            # 余量检测；attempts_base 为本轮起点总请求数）
+            if (task.repeat > 0
+                    and task.total_requests - task.attempts_base >= task.repeat):
                 logger.warning(
-                    "任务失败: tid=%s 累计尝试=%d 原因=已达最大尝试次数(%d)",
-                    tid, task.attempts, task.repeat,
+                    "任务失败: tid=%s 累计总请求=%d 原因=已达最大尝试次数(%d)",
+                    tid, task.total_requests, task.repeat,
                 )
                 self._finish(task, TaskState.FAILED, False, "已达最大尝试次数")
                 return
 
-            outcome, msg = self._do_attempt(task)
-            if outcome != "stopped":
+            before_total = task.total_requests
+            outcome, msg = self._do_attempt(task, skip_seat_check=first_attempt)
+            first_attempt = False
+            if outcome not in ("stopped", "wait"):
                 task.attempts += 1
+            # 本轮只要产生了新请求（抢课或余量检测）就刷新进度
+            if task.total_requests != before_total:
                 self.taskProgress.emit(tid, task.attempts, task.repeat)
             logger.debug(
-                "尝试结束: tid=%s 第%d次 结果=%s msg=%s",
-                tid, task.attempts, outcome, msg,
+                "尝试结束: tid=%s 累计抢课=%d 累计检测=%d 结果=%s msg=%s",
+                tid, task.attempts, task.seat_checks, outcome, msg,
             )
 
             if outcome == "success":
@@ -654,8 +726,18 @@ class TaskScheduler(QObject):
                 self._finish(task, TaskState.STOPPED, False, msg)
                 return
 
-            # retry / qos → 决定间隔
-            if outcome == "qos":
+            # wait / retry / qos → 决定间隔
+            if outcome == "wait":
+                # 先到先得：当前无剩余名额。未发请求、**不计尝试次数**，
+                # 延迟后继续检测（不受 repeat 限制，直到出现余量或用户停止）。
+                qos_hit_count = max(0, qos_hit_count - 1)
+                delay = random.uniform(
+                    max(0.0, float(task.delay_min)),
+                    max(0.0, float(task.delay_max)),
+                )
+                logger.debug("先到先得无余量，等待: tid=%s 计划 sleep=%.2fs", tid, delay)
+                self._sleep_interruptible(tid, delay)
+            elif outcome == "qos":
                 qos_hit_count += 1
                 backoff = min(
                     self._qos_backoff_base * (2 ** (qos_hit_count - 1)),
@@ -678,10 +760,16 @@ class TaskScheduler(QObject):
                 logger.debug("正常间隔: tid=%s 计划 sleep=%.2fs", tid, delay)
                 self._sleep_interruptible(tid, delay)
 
-    def _do_attempt(self, task: GrabTask, allow_relogin: bool = True):
+    def _do_attempt(self, task: GrabTask, allow_relogin: bool = True,
+                    skip_seat_check: bool = False):
         """执行一次尝试，返回 (outcome, msg)。
 
-        outcome: ``"success"`` / ``"failed"`` / ``"stopped"`` / ``"retry"`` / ``"qos"``
+        outcome: ``"success"`` / ``"failed"`` / ``"stopped"`` / ``"retry"`` /
+        ``"qos"`` / ``"wait"``
+        （``"wait"`` = 当前无剩余名额，未发请求、不计尝试次数）。
+
+        ``skip_seat_check=True`` 时跳过余量检测直接发请求 —— 用于任务开始的
+        第一次无条件申请（抽课报名靠它完成；抢课课程也借此立即抢一次）。
         """
         tid = task.teaching_class_id
         attempt_no = task.attempts + 1
@@ -693,6 +781,30 @@ class TaskScheduler(QObject):
         if self._is_stopped(tid):
             logger.debug("限速等待后检测到停止标志: tid=%s 第%d次尝试", tid, attempt_no)
             return "stopped", "已停止"
+
+        # 余量检测：发请求前实时检测剩余名额，无余量则不发请求（等待下一轮）。
+        # 开始任务的第一次尝试跳过该检测（无条件发一次申请）。
+        if not skip_seat_check:
+            # 记录余量检测次数（仅统计真正发起查询的情况，供任务卡片展示）
+            if task.course_number:
+                task.seat_checks += 1
+                self.taskSeatCheck.emit(tid, task.seat_checks)
+            seats = self._refresh_seats(task)
+            if seats is not None and seats <= 0:
+                task.last_msg = "暂无剩余名额，等待中"
+                logger.info(
+                    "无余量: tid=%s 第%d次尝试", tid, attempt_no,
+                )
+                self.taskMessage.emit(tid, task.last_msg)
+                return "wait", task.last_msg
+            if seats is not None:
+                logger.debug("余量=%d: tid=%s", seats, tid)
+            if task.course_number:
+                # 余量查询已消耗一次请求：再取一次令牌，保证 volunteer 与
+                # 查询之间间隔 ≥ min_interval（限速不因多一次查询而漏算）
+                self._rate_limiter.acquire()
+                if self._is_stopped(tid):
+                    return "stopped", "已停止"
 
         logger.debug("调用 volunteer: tid=%s 第%d次尝试", tid, attempt_no)
         try:
@@ -810,6 +922,40 @@ class TaskScheduler(QObject):
         )
         self.taskMessage.emit(tid, task.last_msg)
         return "retry", task.last_msg
+
+    def _refresh_seats(self, task: GrabTask) -> Optional[int]:
+        """先到先得：用课程号反查该教学班最新剩余名额；无法确定返回 ``None``。
+
+        - 未记录课程号（老收藏记录）→ ``None``（无法反查，放行请求）；
+        - 查询/解析失败、未找到该教学班 → ``None``（保守放行，避免漏抢）；
+        - 命中且 ``isFull=="1"`` → ``0``；否则 ``容量 - 已选``（可能为负）。
+        """
+        course_number = task.course_number
+        if not course_number:
+            return None
+        try:
+            rows, _is_last = self._client.fetch_courses(
+                batch_code=task.batch_code,
+                teaching_class_type=task.teaching_class_type,
+                course_kind=task.course_kind,
+                query_content=course_number,
+                page_number=0,
+                page_size=50,
+            )
+        except Exception as e:  # noqa: BLE001 - 查询失败保守放行
+            logger.warning(
+                "先到先得余量查询失败: tid=%s 异常=%s",
+                task.teaching_class_id, e,
+            )
+            return None
+        for course in models.parse_course_rows(
+                rows, task.teaching_class_type, task.course_kind, task.batch_code):
+            if course.teaching_class_id != task.teaching_class_id:
+                continue
+            if course.is_full == "1":
+                return 0
+            return models.remaining_seats(course)
+        return None
 
     def _relogin(self):
         """凭据从 ``state.load_account(setting)`` 取，重新登录一次。"""

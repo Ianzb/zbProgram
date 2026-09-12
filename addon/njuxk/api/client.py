@@ -71,6 +71,13 @@ COURSE_RESULT = "/elective/courseResult.do"
 LOGOUT = "/student/logout.do"
 AUTH_LOGOUT = "/student/authlogout.do"
 
+# 课程红黑榜公共评价库（NJU-Hub 维护，GitHub Raw 静态 JSON）。与本插件登录态
+# 无关，走同一 HTTP 层（zbToolLib）拉取；结构见 core/ratings.py。
+RATINGS_URL = (
+    "https://raw.githubusercontent.com/Mellow-Winds/NJU-Hub/main/"
+    "data/merged_ratings.json"
+)
+
 # 与抓包一致的 Chrome UA（抓包 #23/#31 等）
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -504,6 +511,24 @@ class XkClient:
             timeout=15,
         )
         return result.get("dataList") or []
+
+    # ------------------------------------------------------------------
+    # 课程红黑榜（公共评价库，无需登录）
+    # ------------------------------------------------------------------
+
+    def fetch_ratings(self) -> Dict[str, Any]:
+        """拉取课程红黑榜公共评价库（NJU-Hub 维护的 GitHub Raw JSON）。
+
+        与选课系统无关，走同一 HTTP 层（zbToolLib ``getUrl``，自带日志），
+        **不需要** token/cookie。响应为 ``{"课程名#教师": {...}}`` 大对象，
+        解析/打分/匹配在 ``core/ratings.py`` 完成。失败抛异常，由调用方兜底
+        （保留本地缓存、静默降级）。
+        """
+        resp = zb.getUrl(RATINGS_URL, times=1, timeout=20)
+        if resp is None:
+            raise RuntimeError("红黑榜数据请求失败")
+        resp.raise_for_status()
+        return resp.json()
 
     # ------------------------------------------------------------------
     # 报名与结果轮询

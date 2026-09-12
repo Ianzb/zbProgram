@@ -154,9 +154,9 @@ class CoursePage(QWidget):
             （由 MainPage 响应；本页不再内嵌登录卡）
     """
 
-    # InfoBar / 对话框挂载标记：``ui/cards.py`` 的 ``_dialog_parent`` 沿 parent
-    # 链上溯找插件页面（原来只认 ``zbw.BasicTab``），本页改基类后靠此标记继续
-    # 被识别为插件页面 —— 弹窗遮罩仍覆盖整个选课页，绝不提升到宿主主窗口
+    # 通知/对话框挂载标记：早期 ``ui/cards.py::_dialog_parent`` 依赖它识别插件页；
+    # 现在通知统一由 ``ui/info.info_parent`` 提升到插件最高层级页面（MainPage），
+    # 本标记保留以兼容既有测试/外部引用
     _info_parent_flag = True
 
     enrollRequested = Signal(str)
@@ -164,6 +164,8 @@ class CoursePage(QWidget):
     dropRequested = Signal(str)
     favoriteToggled = Signal(str, bool)
     loginRequired = Signal()
+    #: 「同步评价」按钮：请求装配层同步红黑榜（NJU-Hub 公共评价库）
+    ratingsSyncRequested = Signal()
 
     # 内部线程信号（工作线程 emit，主线程槽接收）
     _batchesReady = Signal(list)
@@ -172,11 +174,13 @@ class CoursePage(QWidget):
     _reloginReady = Signal(bool, str)
     _courseKindMapReady = Signal(object)
 
-    def __init__(self, parent=None, client=None, setting=None, program=None):
+    def __init__(self, parent=None, client=None, setting=None, program=None,
+                 ratings=None):
         super().__init__(parent)
         self.client = client if client is not None else XkClient()
         self._setting = setting
         self._program = program
+        self._ratings = ratings
         self._fallback_pool = None
 
         self._batches = []
@@ -242,7 +246,7 @@ class CoursePage(QWidget):
     def _build_ui(self):
         # 页根布局：工具行 + 类别区 + 卡片滚动区（前三者/前者固定，最后者滚动）
         self.vBoxLayout = QVBoxLayout(self)
-        apply_page_margins(self.vBoxLayout)
+        apply_page_margins(self.vBoxLayout, bottom=0)
 
         # ---- 工具行：批次下拉 + 刷新批次 + 搜索 + 校区 + 刷新课程（同一行）----
         # 需求「不要一个组件一行」：此前批次下拉、刷新、搜索各占一行，纵向空间被
@@ -270,6 +274,13 @@ class CoursePage(QWidget):
             "不重新拉取批次、不重建类别、不影响收藏"
         )
 
+        # 同步红黑榜评价库（NJU-Hub 公共评价库）：点击发 ratingsSyncRequested，
+        # 由装配层在工作线程拉取并缓存；同步后卡片显示「红黑榜 N分·M条」
+        self.ratingsButton = ToolButton(FIF.MESSAGE, self)
+        self.ratingsButton.setToolTip(
+            "同步红黑榜评价库（NJU-Hub 公共评价库；首次/更新评价数据时点击）"
+        )
+
         self.searchEdit = zbw.SearchLineEdit(self)
         self.searchEdit.setPlaceholderText("搜索课程名称 / 课程号 / 教师")
         self.searchEdit.setMinimumWidth(SEARCH_MIN_WIDTH)
@@ -281,6 +292,7 @@ class CoursePage(QWidget):
 
         toolRow.addWidget(self.batchCombo)
         toolRow.addWidget(self.refreshBatchButton)
+        toolRow.addWidget(self.ratingsButton)
         toolRow.addWidget(self.searchEdit, 1)
         toolRow.addWidget(self.campusCombo)
         toolRow.addWidget(self.refreshCoursesButton)
@@ -368,7 +380,7 @@ class CoursePage(QWidget):
         # 页面背景形成大色块）。写法对齐旧版 zbw.BasicTab（BetterScrollArea.view）。
         inner.setStyleSheet("QWidget {background-color: rgba(0,0,0,0); border: none}")
         innerLayout = QVBoxLayout(inner)
-        innerLayout.setContentsMargins(0, 4, 0, 8)
+        innerLayout.setContentsMargins(0, 4, 0, 0)
         innerLayout.setSpacing(SPACING)
 
         # 列表区：CardGroup + 空结果 + 加载更多（全在滚动内容里）
@@ -384,6 +396,13 @@ class CoursePage(QWidget):
         self.loadMoreButton = PushButton("加载更多", inner)
         self.loadMoreButton.hide()
         innerLayout.addWidget(self.loadMoreButton)
+
+        # 末尾弹簧吸收多余纵向空间：CardGroup 纵向策略是 Preferred，滚动内容又被
+        # widgetResizable(True) 撑到整个视口高 —— 没有弹簧时 CardGroup 会被一起拉
+        # 高（实测 3 张卡 372px，视口 580px 时列表区被拉到 568px），即用户反馈的
+        # 「可滚动区域比卡片总高出一截，且各页视口不同多出的空白也不同」。弹簧让
+        # 列表按内容自然高度贴顶，空态/加载更多也紧贴卡片而不是被顶到底部。
+        innerLayout.addStretch(1)
 
         # 卡片滚动区独占剩余纵向空间（stretch=1），工具行/类别区保持固有高度
         self.vBoxLayout.addWidget(self.cardScroll, 1)
@@ -428,6 +447,7 @@ class CoursePage(QWidget):
         self.batchCombo.currentIndexChanged.connect(self._on_batch_changed)
         self.refreshBatchButton.clicked.connect(self.load_batches)
         self.refreshCoursesButton.clicked.connect(self.refresh_courses)
+        self.ratingsButton.clicked.connect(self.ratingsSyncRequested.emit)
         self.campusCombo.currentIndexChanged.connect(self._on_campus_changed)
         self.categoryPivot.currentItemChanged.connect(self._on_category_changed)
         self.searchEdit.searchSignal.connect(self._on_search)
@@ -835,12 +855,19 @@ class CoursePage(QWidget):
                 tactic,
                 self._is_favorited(course.teaching_class_id),
             )
+            card.set_rating(self._lookup_rating(course))
             card.favoriteToggled.connect(self._on_favorite_toggled)
             card.enrollRequested.connect(self.enrollRequested)
             card.grabRequested.connect(self.grabRequested)
             card.dropRequested.connect(self.dropRequested)
+            card.remarkResolved.connect(self._on_remark_resolved)
             self.cardGroup.addCard(card, wid=course.teaching_class_id)
         self._update_empty_and_loadmore()
+
+    def _on_remark_resolved(self, teaching_class_id, remark):
+        """详情接口回填的备注：已收藏则同步进本地收藏记录（未收藏 no-op）。"""
+        if self._setting is not None and remark:
+            state.update_favorite(self._setting, teaching_class_id, {"remark": remark})
 
     def _parse_course_rows(self, rows):
         """按类别路由解析课程行：ZY → programCourse.do 父子结构，其余 → 扁平行。"""
@@ -1010,7 +1037,7 @@ class CoursePage(QWidget):
         if favorited:
             if card is not None and card.course is not None:
                 # 连同当前批次的 tactic_name 一起写入：收藏页没有批次上下文，
-                # 只能靠记录里的策略名算选中概率（缺失时按空串兜底）
+                # 只能靠记录里的字段重建（缺失时兜底）
                 state.add_favorite(
                     self._setting,
                     self._course_to_dict(card.course, card.tactic_name),
@@ -1035,12 +1062,33 @@ class CoursePage(QWidget):
                 continue  # 跳过 LoadingCard 等非课程卡片
             card.set_favorited(self._is_favorited(card.course.teaching_class_id))
 
+    # ------------------------------------------------------------------
+    # 红黑榜（NJU-Hub 公共评价库）
+    # ------------------------------------------------------------------
+
+    def _lookup_rating(self, course):
+        """按课程名 + 教师匹配红黑榜评价；无数据源/未匹配返回 None。"""
+        if self._ratings is None:
+            return None
+        try:
+            return self._ratings.lookup(course.course_name, course.teacher_name)
+        except Exception as e:  # noqa: BLE001 - 匹配失败不影响卡片
+            logging.debug("红黑榜匹配失败：%s", e)
+            return None
+
+    def refresh_rating_badges(self):
+        """按最新红黑榜数据重刷**所有**课程卡片的评价按钮（同步完成后调用）。"""
+        for card in self.cardGroup.getCards():
+            if getattr(card, "course", None) is None:
+                continue  # 跳过 LoadingCard 等非课程卡片
+            card.set_rating(self._lookup_rating(card.course))
+
     @staticmethod
     def _course_to_dict(course, tactic_name="") -> dict:
         """课程 → 收藏记录 dict。
 
         额外写入 ``tactic_name``（**不是** ``Course`` 字段）：收藏页渲染时没有
-        批次上下文，只能从记录里取策略名算选中概率；老记录缺该键时按空串处理。
+        批次上下文，只能从记录里取策略名；老记录缺该键时按空串处理。
         """
         from dataclasses import asdict
 

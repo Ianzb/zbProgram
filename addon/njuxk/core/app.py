@@ -59,6 +59,7 @@ from qfluentwidgets import InfoBar, InfoBarPosition, MessageBox
 from ..api import models
 from ..api.client import XkClient
 from . import state
+from .ratings import RatingsStore
 from .scheduler import GrabTask, TaskScheduler, TaskState
 from .settings import DEFAULTS, get_scheduler_config
 from ..ui.course import CoursePage
@@ -146,6 +147,8 @@ class XkApp(QObject):
     _autoLoginReady = Signal(bool, str)
     # 一键清空：工作线程完成「等停止 + 调度器任务表移除」后 emit，主线程清卡片
     _clearAllReady = Signal()
+    # 红黑榜同步结果：(ok, msg) —— 工作线程 emit，主线程收尾（刷徽标 / 弹提示）
+    _ratingsReady = Signal(bool, str)
 
     def __init__(self, setting, program=None, client=None, window=None):
         super().__init__()
@@ -190,11 +193,21 @@ class XkApp(QObject):
             self.client, setting=setting, program=program,
             min_interval=min_interval,
         )
+        # 红黑榜数据仓库：真实 client 提供 fetch_ratings 时云端同步，否则仅用
+        # 本地缓存（测试注入的 stub client 无该方法 → 不发起网络请求）
+        self._ratings_fetcher = (
+            self.client.fetch_ratings
+            if hasattr(self.client, "fetch_ratings") else None
+        )
+        self.ratings = RatingsStore(setting=setting, fetcher=self._ratings_fetcher)
+        self._ratings_manual = False
         self.course_page = CoursePage(
-            client=self.client, setting=setting, program=program
+            client=self.client, setting=setting, program=program,
+            ratings=self.ratings,
         )
         self.favorites_page = FavoritesPage(
-            client=self.client, setting=setting, program=program
+            client=self.client, setting=setting, program=program,
+            ratings=self.ratings,
         )
         # 选课结果两页（courseResult.do 抓包 [2]/[3]）：other="99"=我的课程
         # （已选中，selectStatus 全 "99"）、other="01"=我的报名（报名/抽签队列，
@@ -264,12 +277,17 @@ class XkApp(QObject):
         # 6/7/8/9. 调度器信号 → 任务页 / InfoBar
         self.scheduler.taskStateChanged.connect(self._on_task_state_changed)
         self.scheduler.taskProgress.connect(self._on_task_progress)
+        self.scheduler.taskSeatCheck.connect(self._on_task_seat_check)
         self.scheduler.taskMessage.connect(self._on_task_message)
         self.scheduler.taskFinished.connect(self._on_task_finished)
         # 启动自动登录：结果经信号回主线程收尾（切页签层 + 加载批次）
         self._autoLoginReady.connect(self._on_auto_login_ready)
         # 账号菜单「退出登录」（MainPage 顶栏）：工作线程登出 → 主线程收尾
         self._logoutReady.connect(self._on_account_logout_ready)
+        # 红黑榜同步结果 → 主线程刷新徽标 / 提示
+        self._ratingsReady.connect(self._on_ratings_ready)
+        # 选课页「同步评价」按钮 → 云端同步红黑榜
+        self.course_page.ratingsSyncRequested.connect(self.request_ratings_sync)
 
     # ------------------------------------------------------------------
     # MainPage 装配（main.addonWidget 创建 MainPage 后调用）
@@ -292,8 +310,13 @@ class XkApp(QObject):
         page.settingsRequested.connect(self._open_settings)
 
     def _open_settings(self):
-        """打开设置对话框（挂 MainPage，绝不挂宿主窗口；本地读写无网络请求）。"""
+        """打开设置对话框（挂 MainPage，绝不挂宿主窗口；本地读写无网络请求）。
+
+        保存成功后 ``configSaved`` → ``scheduler.reload_config()``，使并发线程数 /
+        最小请求间隔 / QoS 退避等调度器参数**即时生效**（不必重启任务）。
+        """
         dialog = SettingsDialog(setting=self._setting, parent=self._info_parent())
+        dialog.configSaved.connect(self.scheduler.reload_config)
         dialog.exec()
 
     def _on_login_card_finished(self, ok, msg):
@@ -309,6 +332,77 @@ class XkApp(QObject):
                 str(getattr(self.client, "student_code", "") or "")
             )
         self.course_page.load_batches()
+        self.load_ratings()
+
+    # ------------------------------------------------------------------
+    # 红黑榜（NJU-Hub 公共评价库）
+    # ------------------------------------------------------------------
+
+    def load_ratings(self, force: bool = False):
+        """加载红黑榜数据：已有缓存且非强制 → 直接刷新徽标；否则工作线程同步。
+
+        网络请求只走 ``self.ratings`` 注入的 fetcher（真实为
+        ``XkClient.fetch_ratings``）；stub client 无该方法时 fetcher 为 None，
+        同步直接失败、不影响任何功能。
+        """
+        if self.ratings is None:
+            return
+        if self.ratings.loaded and not force:
+            self._apply_ratings()
+            return
+        self._ratings_manual = bool(force)
+        self._thread_pool().submit(self._ratings_worker, force)
+
+    def request_ratings_sync(self):
+        """手动「同步评价」：强制云端同步红黑榜（结果弹 InfoBar）。"""
+        self.load_ratings(force=True)
+
+    def _ratings_worker(self, force: bool):
+        """工作线程：同步红黑榜数据，结果经 ``_ratingsReady`` 回主线程。"""
+        try:
+            ok, msg = self.ratings.refresh()
+        except Exception as e:  # noqa: BLE001 - 任何异常都要回主线程收尾
+            ok, msg = False, f"红黑榜同步失败：{e}"
+        self._ratingsReady.emit(ok, msg)
+
+    def _on_ratings_ready(self, ok: bool, msg: str):
+        """主线程：刷新课程/收藏卡片徽标；手动同步时弹提示。"""
+        self._apply_ratings()
+        if self._ratings_manual:
+            if ok:
+                InfoBar.success(
+                    title="红黑榜已同步",
+                    content=msg,
+                    orient=Qt.Orientation.Vertical,
+                    isClosable=True,
+                    duration=4000,
+                    position=InfoBarPosition.TOP_RIGHT,
+                    parent=self._info_parent(),
+                )
+            else:
+                InfoBar.warning(
+                    title="红黑榜同步失败",
+                    content=msg,
+                    orient=Qt.Orientation.Vertical,
+                    isClosable=True,
+                    duration=5000,
+                    position=InfoBarPosition.TOP_RIGHT,
+                    parent=self._info_parent(),
+                )
+        elif not ok:
+            logging.info("红黑榜自动同步失败：%s", msg)
+        self._ratings_manual = False
+
+    def _apply_ratings(self):
+        """按最新红黑榜数据重刷选课页卡片徽标与收藏页列表。"""
+        try:
+            self.course_page.refresh_rating_badges()
+        except Exception as e:  # noqa: BLE001 - 刷新失败不影响主流程
+            logging.debug("刷新选课页红黑榜徽标失败：%s", e)
+        try:
+            self.favorites_page.refresh_list()
+        except Exception as e:  # noqa: BLE001
+            logging.debug("刷新收藏页红黑榜徽标失败：%s", e)
 
     # ------------------------------------------------------------------
     # 启动自动登录（本地保存了账号密码 → 每次打开重新登录一次）
@@ -381,6 +475,7 @@ class XkApp(QObject):
                     parent=self._info_parent(),
                 )
             self.course_page.load_batches()
+            self.load_ratings()
         else:
             # 不静默失败：把中文原因留在登录卡状态标签上
             if self.main_page is not None:
@@ -400,7 +495,8 @@ class XkApp(QObject):
         if course is None:
             return
         card = self.task_page.add_task(
-            course, begin_time=self._batch_begin_time(course.batch_code)
+            course,
+            begin_time=self._batch_begin_time(course.batch_code),
         )
         task = self._build_task(course, card)
         if self.scheduler.add_task(task):
@@ -433,6 +529,7 @@ class XkApp(QObject):
         return GrabTask(
             teaching_class_id=course.teaching_class_id,
             course_name=course.course_name,
+            course_number=course.course_number,
             course_kind=course.course_kind,
             teaching_class_type=course.teaching_class_type,
             batch_code=course.batch_code,
@@ -955,6 +1052,11 @@ class XkApp(QObject):
         card = self.task_page.get_task(teaching_class_id)
         if card is not None:
             card.set_progress(attempts, repeat)
+
+    def _on_task_seat_check(self, teaching_class_id, count):
+        card = self.task_page.get_task(teaching_class_id)
+        if card is not None:
+            card.set_seat_check(count)
 
     def _on_task_message(self, teaching_class_id, msg):
         card = self.task_page.get_task(teaching_class_id)

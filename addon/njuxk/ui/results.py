@@ -6,11 +6,12 @@
 删除按钮：我的课程页文案「退选」、我的报名页文案「取消报名」，后端同一
 ``delete_volunteer`` 流程。
 
-展示（用户需求「以课程列表的形式在单独的标签页展示结果，课程多了一个备注信息
-需要显示」）：每门课一张 :class:`ResultCard`——课程名（加粗）+ ⓘ详细信息按钮
-（复用 ``CourseInfoDialog``，只传 ``Course`` 对象）+ 元信息行（教师/学分/校区/
-上课时间/选修类型/类别）+ **备注行**（``remark``（来自服务端 ``extInfo``，空时回落 ``comment``）非空才
-显示，MESSAGE 图标 + 橙色多行文本，可选中复制，明暗主题都可读）；``canDelete=="1"`` 的卡片有删除按钮（文案按页面）。
+展示（用户需求「以课程列表的形式在单独的标签页展示结果」+「我的报名/我的课程
+的课程卡片改成与选课/收藏页一样的布局」）：每门课一张 :class:`ResultCard`
+（继承选课/收藏页的 :class:`~njuxk.ui.cards.CourseCard`，**布局完全一致**——
+编号/课程名/学分、教师、时间地点、校区 + 已选容量 + 选中概率、简介、备注 +
+右侧按钮列），结果页只保留删除按钮（``canDelete=="1"`` 才显示，文案按页面：
+我的课程「退选」/ 我的报名「取消报名」），隐藏收藏/报名/抢课。
 
 批次码来源：``state.load_selection(setting)`` 的 ``selected_batch``（与选课页
 持久化的同一份）；无批次时空态提示「请先在选课页选择批次」，不发请求。
@@ -32,17 +33,15 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 from qtpy.QtCore import Qt, Signal
-from qtpy.QtWidgets import QFrame, QHBoxLayout, QSizePolicy, QVBoxLayout, QWidget
+from qtpy.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget
 
 from qfluentwidgets import (
     BodyLabel,
     FluentIcon as FIF,
-    IconWidget,
     PushButton,
     SmoothScrollArea,
     StrongBodyLabel,
     ToolButton,
-    TransparentToolButton,
 )
 
 import zbWidgetLib as zbw
@@ -50,7 +49,7 @@ import zbWidgetLib as zbw
 from ..api import models
 from ..api.client import XkClient
 from ..core import state
-from .cards import CourseInfoDialog
+from .cards import CourseCard
 from .layout import SPACING, apply_page_margins, apply_tool_row
 from .login import _host_program, _host_setting
 from .text_select import make_selectable
@@ -58,160 +57,29 @@ from .text_select import make_selectable
 #: 加载卡在 ``cardGroup`` 里的占位 id（``_hide_loading`` 按它移除）
 LOADING_WID = "__result_loading__"
 
-#: 备注行文字色（醒目橙色系，明/暗主题各一档，浅色深橙、深色亮橙保证可读）
-_REMARK_LIGHT = "#9a5b00"
-_REMARK_DARK = "#ffb02e"
+
+def _format_credits(total: float) -> str:
+    """学分汇总展示：整数不带小数点，非整数最多保留 2 位并去掉末尾 0。"""
+    if abs(total - round(total)) < 1e-9:
+        return str(int(round(total)))
+    return f"{total:.2f}".rstrip("0").rstrip(".")
 
 
-class ResultCard(zbw.CardWidget):
-    """选课结果卡片（我的课程 / 我的报名共用，``allow_drop`` 控制删除按钮）。"""
+class ResultCard(CourseCard):
+    """选课结果卡片（我的课程 / 我的报名共用）。
 
-    # 删除请求（teaching_class_id）；``can_delete=="1"`` 的卡片显示按钮，
-    # 文案按页面类型（「退选」/「取消报名」），后端同一 delete_volunteer 流程。
-    dropRequested = Signal(str)
+    布局与选课/收藏页的 :class:`~njuxk.ui.cards.CourseCard` **完全一致**：
+    编号 + 课程名 + 学分 / 教师 / 时间地点 / 校区 + 已选容量 + 选中概率 /
+    简介 / 备注 + 右侧按钮列。结果页只保留删除按钮（``can_delete=="1"``
+    才显示），隐藏收藏/报名/抢课。
+
+    ``allow_drop`` 兼容旧调用（结果页恒为 ``True``）；``drop_label`` 决定按钮
+    文案（我的课程「退选」/ 我的报名「取消报名」）。
+    """
 
     def __init__(self, parent=None, allow_drop=False, drop_label="退选"):
-        super().__init__(parent)
-        self.course = None
-        # 详情接口客户端：由 CourseResultPage 注入（None 时详情弹窗网络节显示
-        # 错误 + 重试，本地字段照常显示——与 CourseCard 同一契约）
-        self.client = None
+        super().__init__(parent, result_mode=True, drop_label=drop_label)
         self._allow_drop = bool(allow_drop)
-        self._drop_label = drop_label or "退选"
-        self._build_ui()
-        self._connect_signals()
-
-    # ------------------------------------------------------------------
-    # UI 构建
-    # ------------------------------------------------------------------
-
-    def _build_ui(self):
-        # 标题行：课程名（加粗）+ ⓘ详细信息按钮紧贴其右（照 CourseCard 最新
-        # 布局范式：标题与按钮同布局、间距 4px）
-        self.courseNameLabel = make_selectable(StrongBodyLabel(self))
-        self.infoButton = TransparentToolButton(FIF.INFO, self)
-        self.infoButton.setToolTip("详细信息")
-
-        # 元信息行：教师 / 学分 / 校区 / 上课时间 / 选修类型 / 类别（空段跳过）
-        self.metaLabel = make_selectable(BodyLabel(self))
-        self.metaLabel.setWordWrap(True)
-        self.metaLabel.setTextColor("#606060", "#d2d2d2")
-
-        # 备注行：MESSAGE 图标 + 「备注：…」（remark 非空才显示；qfw 1.11.3
-        # 无 FIF.ATTENTION，MESSAGE 气泡与「加QQ群」类公告语义最贴切）。
-        # 备注来自 extInfo（可为多行长通知）：wordWrap 完整显示不截断 +
-        # 可选中复制（长通知用户大概率要复制 QQ 群号），橙色文字明暗主题可读
-        self.remarkIcon = IconWidget(FIF.MESSAGE, self)
-        self.remarkIcon.setFixedSize(16, 16)
-        self.remarkLabel = make_selectable(BodyLabel(self))
-        self.remarkLabel.setWordWrap(True)
-        self.remarkLabel.setTextColor(_REMARK_LIGHT, _REMARK_DARK)
-        # 宽度自适应：横向 size policy 用 Ignored，多行长文本换行显示而非把
-        # 最小宽度撑大（长 URL/长句不撑破卡片，宽度跟随滚动区）
-        self.remarkLabel.setSizePolicy(
-            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum
-        )
-        self.remarkRow = QWidget(self)
-        remarkLayout = QHBoxLayout(self.remarkRow)
-        remarkLayout.setContentsMargins(0, 0, 0, 0)
-        remarkLayout.setSpacing(6)
-        # 图标顶对齐：多行备注时图标不悬在中间
-        remarkLayout.addWidget(self.remarkIcon, 0, Qt.AlignmentFlag.AlignTop)
-        remarkLayout.addWidget(self.remarkLabel, 1)
-        self.remarkRow.hide()
-
-        # 删除按钮：canDelete=="1" 才显示（见 set_course）；文案按页面类型
-        # 由构造参数 drop_label 决定（我的课程页「退选」/ 我的报名页「取消报名」）
-        self.dropButton = PushButton(FIF.DELETE, self._drop_label, self)
-        self.dropButton.setToolTip(f"{self._drop_label}该课程（需二次确认）")
-        self.dropButton.hide()
-
-        titleRow = QHBoxLayout()
-        titleRow.setContentsMargins(0, 0, 0, 0)
-        titleRow.setSpacing(4)
-        titleRow.addWidget(self.courseNameLabel)
-        titleRow.addWidget(self.infoButton)
-        titleRow.addStretch(1)
-
-        left = QVBoxLayout()
-        left.setSpacing(6)
-        left.addLayout(titleRow)
-        left.addWidget(self.metaLabel)
-        left.addWidget(self.remarkRow)
-
-        right = QVBoxLayout()
-        right.setSpacing(8)
-        right.addWidget(self.dropButton)
-        right.addStretch(1)
-
-        self.hBoxLayout = QHBoxLayout(self)
-        self.hBoxLayout.setContentsMargins(16, 12, 12, 12)
-        self.hBoxLayout.setSpacing(16)
-        self.hBoxLayout.addLayout(left, 1)
-        self.hBoxLayout.addLayout(right)
-
-    def _connect_signals(self):
-        self.dropButton.clicked.connect(self._on_drop_clicked)
-        self.infoButton.clicked.connect(self._on_info_clicked)
-
-    # ------------------------------------------------------------------
-    # 数据更新
-    # ------------------------------------------------------------------
-
-    def set_course(self, course):
-        """用一门结果课程刷新全部展示。"""
-        self.course = course
-        self.courseNameLabel.setText(course.course_name)
-        # 元信息行：空段（教师/学分/校区等缺失）整体跳过，不留「 · 」残渣
-        parts = [
-            course.teacher_name,
-            f"{course.credit} 学分" if course.credit else "",
-            course.campus_name,
-            course.teaching_place,
-            course.elective_type,
-            course.category_name,
-        ]
-        self.metaLabel.setText(" · ".join(p for p in parts if p))
-        # 备注行：remark 非空才显示（醒目前缀「备注：」+ 橙色文字）
-        remark = (course.remark or "").strip()
-        self.remarkLabel.setText(f"备注：{remark}")
-        self.remarkRow.setVisible(bool(remark))
-        # 删除按钮：仅 allow_drop 且 canDelete=="1"（文案见构造参数 drop_label）
-        show_drop = (
-                self._allow_drop
-                and course.can_delete == "1"
-                and bool(course.teaching_class_id)
-        )
-        self.dropButton.setVisible(show_drop)
-
-    # ------------------------------------------------------------------
-    # 信号
-    # ------------------------------------------------------------------
-
-    def _on_drop_clicked(self):
-        if self.course is None:
-            return
-        self.dropRequested.emit(self.course.teaching_class_id)
-
-    def _on_info_clicked(self):
-        """点「详细信息」：弹课程详情弹窗（复用 CourseInfoDialog，只传 Course）。"""
-        if self.course is None:
-            return
-        self._info_dialog = CourseInfoDialog(
-            self.course, client=self.client, parent=self._dialog_parent()
-        )
-        self._info_dialog.exec()
-
-    def _dialog_parent(self):
-        """详细信息弹窗的父级：最近的插件页面（对齐 ``ui/cards.py`` 契约）。"""
-        widget = self.parentWidget()
-        while widget is not None:
-            if isinstance(widget, zbw.BasicTab) or getattr(
-                    widget, "_info_parent_flag", False
-            ):
-                return widget
-            widget = widget.parentWidget()
-        return self
 
 
 class CourseResultPage(QWidget):
@@ -219,7 +87,7 @@ class CourseResultPage(QWidget):
 
     布局（三页既定范式，结构冻结）：工具行（标题 + 计数 + 刷新）固定在页根，
     只有卡片列表在页内唯一一个纵向 ``SmoothScrollArea``（``resultScroll``）里
-    滚动；``_info_parent_flag = True`` 使详情弹窗 / 遮罩挂本页（不挂宿主窗口）。
+    滚动；通知/弹窗由 ``ui/info.info_parent`` 统一提升到插件最高层级页面（MainPage）。
 
     信号：
         dropRequested(str) —— 删除请求（teaching_class_id），转发自卡片
@@ -298,7 +166,7 @@ class CourseResultPage(QWidget):
     def _build_ui(self):
         # 页根布局：工具行（固定）+ 卡片滚动区（滚动）
         self.vBoxLayout = QVBoxLayout(self)
-        apply_page_margins(self.vBoxLayout)
+        apply_page_margins(self.vBoxLayout, bottom=0)
 
         # ---- 工具行：标题 + 计数 + 刷新 ----
         toolRow = apply_tool_row(QHBoxLayout())
@@ -327,7 +195,7 @@ class CourseResultPage(QWidget):
         self.resultScroll.enableTransparentBackground()
         inner.setStyleSheet("QWidget {background-color: rgba(0,0,0,0); border: none}")
         innerLayout = QVBoxLayout(inner)
-        innerLayout.setContentsMargins(0, 4, 0, 8)
+        innerLayout.setContentsMargins(0, 4, 0, 0)
         innerLayout.setSpacing(SPACING)
 
         # 列表区：CardGroup + 空态 + 错误行（全在滚动内容里）
@@ -353,6 +221,11 @@ class CourseResultPage(QWidget):
         errorLayout.addWidget(self.retryButton)
         self.errorRow.hide()
         innerLayout.addWidget(self.errorRow)
+
+        # 末尾弹簧吸收多余纵向空间：CardGroup 纵向策略是 Preferred，滚动内容又被
+        # widgetResizable(True) 撑到整个视口高，没有弹簧时列表区会被拉得比卡片总高
+        # 出一截（用户反馈各页多出的空白还不一样）。弹簧让列表按内容自然高度贴顶。
+        innerLayout.addStretch(1)
 
         # 卡片滚动区独占剩余纵向空间（stretch=1），工具行保持固有高度
         self.vBoxLayout.addWidget(self.resultScroll, 1)
@@ -428,11 +301,24 @@ class CourseResultPage(QWidget):
             card.dropRequested.connect(self.dropRequested)
             self.cardGroup.addCard(card, wid=course.teaching_class_id)
         total = len(self._loaded_courses)
-        self.countLabel.setText(f"共 {total} 门")
+        credits = self._total_credits()
+        self.countLabel.setText(
+            f"共 {total} 门 · 总学分 {_format_credits(credits)}"
+        )
         self.emptyLabel.setText(
             "暂无已选课程" if self._other == "99" else "暂无报名记录"
         )
         self.emptyLabel.setVisible(total == 0)
+
+    def _total_credits(self) -> float:
+        """当前列表内可解析学分之和（credit 缺失/非数字的课程跳过）。"""
+        total = 0.0
+        for course in self._loaded_courses:
+            try:
+                total += float(course.credit)
+            except (TypeError, ValueError):
+                continue
+        return total
 
     def _on_load_error(self, payload):
         """主线程：显示错误行 + 重试按钮（过期响应按序号丢弃）。"""

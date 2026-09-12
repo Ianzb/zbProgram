@@ -107,6 +107,8 @@ from qfluentwidgets.components.widgets.table_view import TableItemDelegate
 import zbWidgetLib as zbw
 
 from ..api import models
+from .info import info_parent
+from .ratings import rating_color
 from .text_select import make_selectable
 
 #: 课程大纲各节 key 标签统一列宽（覆盖全部 KV 键文案），值列因此跨节左对齐
@@ -246,8 +248,10 @@ class CourseCard(zbw.CardWidget):
     enrollRequested = Signal(str)
     grabRequested = Signal(str)
     dropRequested = Signal(str)
+    #: 详情接口回填的备注（teaching_class_id, 合并后的备注）——供页面持久化
+    remarkResolved = Signal(str, str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, result_mode=False, drop_label="退选"):
         super().__init__(parent)
         self.course = None
         # 详情接口客户端：由装配页（CoursePage / FavoritesPage）注入；
@@ -256,6 +260,12 @@ class CourseCard(zbw.CardWidget):
         self._tactic_name = ""
         self._favorited = False
         self._chosen = False
+        #: 结果页模式（我的课程/我的报名）：布局与选课/收藏页一致，但只保留
+        #: 删除按钮（退选/取消报名），隐藏收藏/报名/抢课
+        self._result_mode = bool(result_mode)
+        self._drop_label = drop_label or "退选"
+        #: 结果页模式下是否允许显示删除按钮（由 ResultCard 的 allow_drop 控制）
+        self._allow_drop = True
         self._build_ui()
         self._connect_signals()
 
@@ -269,6 +279,10 @@ class CourseCard(zbw.CardWidget):
         # 已报名徽标：用 SUCCESS 变体（绿色）与「已收藏」（ATTENTION 红）区分
         self.chosenBadge = zbw.InfoBadge("已报名", self, InfoLevel.SUCCESS)
         self.chosenBadge.hide()
+        # 课程类别标签（专业/公选课/体育…）：由 course.teaching_class_type 映射
+        # 中文名（见 _kind_display_name）；无类别信息时隐藏
+        self.categoryBadge = zbw.InfoBadge("", self, InfoLevel.INFOAMTION)
+        self.categoryBadge.hide()
 
         self.courseNumberLabel = make_selectable(BodyLabel(self))
         self.courseNumberLabel.setTextColor("#606060", "#d2d2d2")
@@ -283,13 +297,24 @@ class CourseCard(zbw.CardWidget):
         self.introLabel = make_selectable(BodyLabel(self))
         self.introLabel.setWordWrap(False)
 
+        # 红黑榜：分数文本（按高低着色：高分绿 / 中分黄 / 低分红）与评论按钮
+        # **分开显示**；匹配到评价时才显示，未匹配/未同步时一起隐藏（不占位）
+        self.ratingScoreLabel = make_selectable(BodyLabel(self))
+        self.ratingScoreLabel.hide()
+        self.ratingButton = PushButton(FIF.MESSAGE, "评价", self)
+        self.ratingButton.setToolTip("查看该课程的红黑榜评价（NJU-Hub 公共评价库）")
+        self.ratingButton.hide()
+        self._rating = None
+
         # PushButton（图标 + 文字正常排版），不能用 ToolButton（纯图标，文字会压图标）
         self.favButton = PushButton(FIF.HEART, "收藏", self)
         self.favButton.setToolTip("收藏到本地收藏集")
         self.enrollButton = PrimaryPushButton("立即报名", self)
         self.grabButton = PushButton(FIF.PLAY, "加入抢课", self)
-        # 退选：网页 UI 用词是「退选」，仅已报名时显示，点击后由装配层弹二次确认
-        self.dropButton = PushButton(FIF.DELETE, "退选", self)
+        # 退选/取消报名：结果页模式（我的课程/我的报名）唯一动作按钮，文案由
+        # 构造参数 drop_label 决定；普通模式仅已报名时显示，点击后由装配层弹二次确认
+        self.dropButton = PushButton(FIF.DELETE, self._drop_label, self)
+        self.dropButton.setToolTip(f"{self._drop_label}该课程（需二次确认）")
         self.dropButton.hide()
         # 详细信息：纯图标按钮（弹窗展示课程大纲 + 教学周历），
         # 用户要求放在课程标题文字右边紧贴（同一行、小间距，不占独立按钮列）
@@ -304,6 +329,7 @@ class CourseCard(zbw.CardWidget):
         row1.addWidget(self.favBadge)
         row1.addWidget(self.chosenBadge)
         row1.addWidget(self.courseNumberLabel)
+        row1.addWidget(self.categoryBadge)
         titleRow = QHBoxLayout()
         titleRow.setContentsMargins(0, 0, 0, 0)
         titleRow.setSpacing(4)
@@ -327,35 +353,81 @@ class CourseCard(zbw.CardWidget):
         row4.addWidget(self.campusLabel)
         row4.addWidget(self.capacityLabel)
         row4.addWidget(self.probabilityLabel)
+        row4.addWidget(self.ratingScoreLabel)
+        row4.addWidget(self.ratingButton)
         row4.addStretch(1)
 
         # 第五行：课程简介（单行省略）
         row5 = QHBoxLayout()
         row5.addWidget(self.introLabel, 1)
 
+        # 第六行：备注（服务端 extInfo/comment/extMsg，非空才显示；照 ResultCard
+        # 备注行范式：MESSAGE 图标 + 橙色多行文本 + 可选中复制）
+        self.remarkIcon = IconWidget(FIF.MESSAGE, self)
+        self.remarkIcon.setFixedSize(16, 16)
+        self.remarkLabel = make_selectable(BodyLabel(self))
+        self.remarkLabel.setWordWrap(True)
+        self.remarkLabel.setTextColor(_REMARK_LIGHT, _REMARK_DARK)
+        self.remarkLabel.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum
+        )
+        self.remarkRow = QWidget(self)
+        remarkLayout = QHBoxLayout(self.remarkRow)
+        remarkLayout.setContentsMargins(0, 0, 0, 0)
+        remarkLayout.setSpacing(6)
+        remarkLayout.addWidget(self.remarkIcon, 0, Qt.AlignmentFlag.AlignTop)
+        remarkLayout.addWidget(self.remarkLabel, 1)
+        self.remarkRow.hide()
+
         left = QVBoxLayout()
-        left.setSpacing(6)
+        left.setSpacing(4)
         left.addLayout(row1)
         left.addLayout(row2)
         left.addLayout(row3)
         left.addLayout(row4)
         left.addLayout(row5)
+        left.addWidget(self.remarkRow)
 
         # 右侧按钮列（收藏/报名/抢课/退选，次序与点击区域不变；详细信息按钮
-        # 已上移到标题行，见 row1 的 titleRow）
+        # 已上移到标题行，见 row1 的 titleRow）。**不在此处加 stretch**：按钮的
+        # 垂直铺排由 _relayout_action_buttons 统一管理（首个按钮顶对齐、其余
+        # 空间均分到按钮之间与末尾），避免按钮下方留出大片空白
         right = QVBoxLayout()
         right.setSpacing(8)
         right.addWidget(self.favButton)
         right.addWidget(self.enrollButton)
         right.addWidget(self.grabButton)
         right.addWidget(self.dropButton)
-        right.addStretch(1)
+        self._rightLayout = right
 
         self.hBoxLayout = QHBoxLayout(self)
         self.hBoxLayout.setContentsMargins(16, 12, 12, 12)
         self.hBoxLayout.setSpacing(16)
         self.hBoxLayout.addLayout(left, 1)
         self.hBoxLayout.addLayout(right)
+        self._relayout_action_buttons()
+
+    def _relayout_action_buttons(self):
+        """重排右侧按钮列：首个可见按钮顶对齐，剩余高度均分到按钮之间与末尾。
+
+        左侧信息列通常比右侧按钮列高，若不处理，按钮列底部会留出大片空白
+        （用户实测反馈）。这里把可见按钮按「顶对齐 + 间隙均分」铺满列高，使
+        按钮下方空白与按钮间距一致，不再突兀。
+        """
+        layout = self._rightLayout
+        while layout.count():
+            layout.takeAt(0)  # 取出旧项（保留按钮 widget，丢弃旧 stretch）
+        layout.setSpacing(0)
+        buttons = (self.favButton, self.enrollButton,
+                   self.grabButton, self.dropButton)
+        visible = [b for b in buttons if not b.isHidden()]
+        if not visible:
+            return
+        layout.addWidget(visible[0])
+        for button in visible[1:]:
+            layout.addStretch(1)
+            layout.addWidget(button)
+        layout.addStretch(1)
 
     def _connect_signals(self):
         self.favButton.clicked.connect(self._on_fav_clicked)
@@ -363,6 +435,7 @@ class CourseCard(zbw.CardWidget):
         self.grabButton.clicked.connect(self._on_grab_clicked)
         self.dropButton.clicked.connect(self._on_drop_clicked)
         self.infoButton.clicked.connect(self._on_info_clicked)
+        self.ratingButton.clicked.connect(self._on_rating_clicked)
 
     # ------------------------------------------------------------------
     # 数据更新
@@ -372,8 +445,7 @@ class CourseCard(zbw.CardWidget):
     def tactic_name(self) -> str:
         """当前卡片的批次策略名（``set_course`` 传入，空串表示未知）。
 
-        选课页加入收藏时用它把策略名一并写入本地收藏记录，收藏页才能按同一
-        公式算出概率（见 :func:`~njuxk.api.models.selection_probability`）。
+        选课页加入收藏时用它把策略名一并写入本地收藏记录。
         """
         return self._tactic_name
 
@@ -385,6 +457,7 @@ class CourseCard(zbw.CardWidget):
         """
         self.course = course
         self._tactic_name = tactic_name or ""
+        self._update_category_badge()
         self.courseNumberLabel.setText(course.course_number)
         self.courseNameLabel.setText(course.course_name)
         self.creditLabel.setText(f"{course.credit} 学分")
@@ -397,6 +470,7 @@ class CourseCard(zbw.CardWidget):
         prob = models.selection_probability(course, self._tactic_name)
         self.probabilityLabel.setText(f"选中概率: {prob}")
         self._update_intro()
+        self._update_remark()
         self.set_favorited(favorited)
         self.set_chosen(self.course.is_choose == "1")
         self._update_action_buttons()
@@ -412,6 +486,55 @@ class CourseCard(zbw.CardWidget):
         self._chosen = bool(flag)
         self.chosenBadge.setVisible(self._chosen)
 
+    def _update_category_badge(self):
+        """课程类别标签（专业/公选课/体育…）。
+
+        取 ``course.category_name``（结果行 ``kclx``）优先，否则用
+        :func:`_kind_display_name` 把 ``teaching_class_type`` 菜单码映射为中文名
+        （未收录的 code 回退显示 code 本身）；两者都空时隐藏，不留空徽标。
+        """
+        name = ""
+        if self.course is not None:
+            name = (self.course.category_name or "").strip()
+            if not name:
+                name = _kind_display_name(self.course).strip()
+        if not name:
+            self.categoryBadge.hide()
+            return
+        self.categoryBadge.setText(name)
+        self.categoryBadge.show()
+
+    def set_rating(self, info):
+        """设置红黑榜评价信息（``RatingsStore.lookup`` 的返回，``None`` 隐藏）。
+
+        ``info`` 形如 ``{"name","teachers","score","count","reviews"}``。
+        分数文本与评论按钮**分开显示**：分数按高低着色（高分绿 / 中分黄 /
+        低分红），按钮文案 ``评价 N条``，点击弹评价详情。
+        """
+        self._rating = info if isinstance(info, dict) else None
+        if not self._rating:
+            self.ratingScoreLabel.hide()
+            self.ratingButton.hide()
+            return
+        score = self._rating.get("score", "")
+        count = self._rating.get("count", 0)
+        self.ratingScoreLabel.setText(f"红黑榜 {score}分")
+        self.ratingScoreLabel.setTextColor(*rating_color(score))
+        self.ratingScoreLabel.show()
+        self.ratingButton.setText(f"评价 {count}条")
+        self.ratingButton.show()
+
+    def _on_rating_clicked(self):
+        """点「红黑榜」按钮：弹评价详情弹窗（主线程）。"""
+        if self.course is None or not self._rating:
+            return
+        from .ratings import RatingsDialog
+
+        self._rating_dialog = RatingsDialog(
+            self.course, self._rating, parent=self._dialog_parent()
+        )
+        self._rating_dialog.exec()
+
     def _update_action_buttons(self):
         """已报名 → 隐藏报名/抢课并显示「退选」；已满 → 两个按钮同时禁用。
 
@@ -422,19 +545,40 @@ class CourseCard(zbw.CardWidget):
         """
         if self.course is None:
             return
+        if self._result_mode:
+            # 结果页（我的课程/我的报名）：只保留删除按钮，隐藏收藏/报名/抢课；
+            # canDelete=="1" 才显示（文案按页面：退选 / 取消报名）
+            self.favButton.hide()
+            self.enrollButton.hide()
+            self.grabButton.hide()
+            show_drop = (
+                    self._allow_drop
+                    and self.course.can_delete == "1"
+                    and bool(self.course.teaching_class_id)
+            )
+            self.dropButton.setVisible(show_drop)
+            self.dropButton.setEnabled(True)
+            self.dropButton.setToolTip(f"{self._drop_label}该课程（需二次确认）")
+            self._relayout_action_buttons()
+            return
         if self.course.is_choose == "1":
             self.enrollButton.hide()
             self.grabButton.hide()
             self.dropButton.setVisible(True)
             self.dropButton.setEnabled(True)
-            self.dropButton.setToolTip("退选该课程（需二次确认）")
+            self.dropButton.setToolTip(f"{self._drop_label}该课程（需二次确认）")
         else:
             self.dropButton.hide()
             self.enrollButton.setVisible(True)
             self.grabButton.setVisible(True)
             if self.course.is_full == "1":
-                self._set_action_enabled(
-                    False, "课程已满，无法报名", "课程已满，无法抢课"
+                # 已满：不支持立即报名（会被服务端拒绝），但**支持加入抢课**
+                # （捡漏模式：等待名额释放后自动抢），随机分配与先到先得一致
+                self.enrollButton.setEnabled(False)
+                self.enrollButton.setToolTip("课程已满，无法立即报名")
+                self.grabButton.setEnabled(True)
+                self.grabButton.setToolTip(
+                    "课程已满：加入抢课任务后自动等待名额（捡漏）"
                 )
             else:
                 self._set_action_enabled(
@@ -442,6 +586,8 @@ class CourseCard(zbw.CardWidget):
                     "立即提交一次报名请求，结果马上弹出（只试一次）",
                     "加入抢课任务，按定时与重试参数持续抢课，成功后自动停止",
                 )
+        # 可见按钮集合变化（报名/抢课 ⇄ 退选）后重排按钮列，避免底部空白
+        self._relayout_action_buttons()
 
     def _set_action_enabled(self, enabled, enroll_tip, grab_tip):
         """统一设置两个动作按钮的可用性与 tooltip。"""
@@ -451,17 +597,27 @@ class CourseCard(zbw.CardWidget):
         self.grabButton.setToolTip(grab_tip)
 
     def _update_intro(self):
-        """课程简介：超长省略为单行，全文放 tooltip。"""
+        """课程简介：超长省略为单行，全文放 tooltip；为空时隐藏整行（不留空行）。"""
         text = self.course.kcjj if self.course is not None else ""
         self.introLabel.setToolTip(text)
         if not text:
             self.introLabel.setText("")
+            self.introLabel.hide()
             return
+        self.introLabel.show()
         fm = QFontMetrics(self.introLabel.font())
         width = self.introLabel.width()
         if width <= 0:
             width = 600
         self.introLabel.setText(fm.elidedText(text, Qt.TextElideMode.ElideRight, width))
+
+    def _update_remark(self):
+        """备注行：``course.remark`` 非空才显示（「备注：」前缀 + 橙色多行文本）。"""
+        remark = ""
+        if self.course is not None:
+            remark = (self.course.remark or "").strip()
+        self.remarkLabel.setText(f"备注：{remark}")
+        self.remarkRow.setVisible(bool(remark))
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -493,37 +649,40 @@ class CourseCard(zbw.CardWidget):
         self.dropRequested.emit(self.course.teaching_class_id)
 
     def _dialog_parent(self):
-        """详细信息弹窗的父级：最近的插件页面（``zbw.BasicTab`` 或带标记的页面）。
+        """详细信息 / 评价弹窗的父级：插件最高层级页面（MainPage）。
 
-        契约（test_main_page_ui 的 grep 规则）：提示/对话框一律挂**插件页面**，
-        绝不提升到宿主主窗口 —— 卡片沿 parent 链上溯找所属页签页，遮罩即可覆盖
-        整个插件页区域。独立构造的卡片（测试环境、无页面祖先）退回卡片自身。
-
-        插件页面识别：``zbw.BasicTab`` 实例（favorites/tasks 页），或带
-        ``_info_parent_flag`` 类标记的页面 —— ``CoursePage`` 改基类为 QWidget
-        （顶栏固定，只有卡片列表滚动，见 ``ui/course.py``）后无法再被
-        ``isinstance(BasicTab)`` 识别，靠该标记继续命中。
+        需求「统一所有通知都在插件的最高层级页面显示」：卡片沿 parent 链上溯
+        找 ``_is_main_page`` 标记的 MainPage（见 :func:`njuxk.ui.info.info_parent`），
+        使弹窗 / 遮罩统一覆盖整个插件页区域，且绝不提升到宿主主窗口。独立构造
+        的卡片（测试环境、无页面祖先）退回卡片自身。
         """
-        widget = self.parentWidget()
-        while widget is not None:
-            if isinstance(widget, zbw.BasicTab) or getattr(
-                    widget, "_info_parent_flag", False
-            ):
-                return widget
-            widget = widget.parentWidget()
-        return self
+        return info_parent(self)
 
     def _on_info_clicked(self):
         """点「详细信息」：主线程直接弹课程详情弹窗（弹窗自己异步拉详情）。
 
         ``exec`` 是模态调用（正常用户路径），测试用替身替换该方法避免阻塞。
+        详情接口若返回备注，回填到卡片（列表行无备注时补齐）。
         """
         if self.course is None:
             return
         self._info_dialog = CourseInfoDialog(
             self.course, client=self.client, parent=self._dialog_parent()
         )
+        self._info_dialog.serverRemarkResolved.connect(self._on_server_remark)
         self._info_dialog.exec()
+
+    def _on_server_remark(self, remark):
+        """详情接口的备注回填到卡片并通知页面持久化（列表行无备注时补齐）。"""
+        if not remark or self.course is None:
+            return
+        current = (self.course.remark or "").strip()
+        if remark in current:
+            return
+        merged = f"{current}\n{remark}" if current else remark
+        self.course.remark = merged
+        self._update_remark()
+        self.remarkResolved.emit(self.course.teaching_class_id, merged)
 
 
 def _kind_display_name(course) -> str:
@@ -611,6 +770,8 @@ class CourseInfoDialog(MessageBoxBase):
     _infoError = Signal(str)
     _scheduleReady = Signal(object)
     _scheduleError = Signal(str)
+    #: 详情接口解析出服务端备注（供卡片回填；空则不发出）
+    serverRemarkResolved = Signal(str)
 
     #: 弹窗固定宽度（key-value 双列网格 + 换行长文本 + 复制按钮需要比旧版更宽）
     WIDTH = 680
@@ -944,17 +1105,26 @@ class CourseInfoDialog(MessageBoxBase):
             self._remark_parts.append(remark)
             self._render_remark()
 
-    def _apply_server_remark(self, node):
-        """详情节点 remark / extMsg 非空 → 补充显示（与本地备注去重拼接）。
+    @staticmethod
+    def _extract_server_remark(resp):
+        """从详情响应里取服务端备注：``data.remark/extMsg`` 优先，顶层 ``extmsg`` 兜底。
 
-        服务端优先取节点 ``remark``，为空回落 ``extMsg``（本抓包恰好为空，
-        但两者都是服务端字段，任何课程都可能带值）。与已显示文本不同且非空
-        时**拼接**在本地备注之后（各占一行）；相同则只显示一份。
-        detail 请求失败或未返回时不调用本方法。
+        详情接口（querykcxx.do）的备注字段可能落在 ``data`` 节点，也可能在响应
+        顶层（``extmsg``）；都取不到返回空串。detail 请求失败或未返回时不调用。
         """
-        remark = str(node.get("remark") or "").strip()
-        if not remark:
-            remark = str(node.get("extMsg") or "").strip()
+        node = (resp or {}).get("data") if isinstance(resp, dict) else None
+        for source in (node, resp):
+            if not isinstance(source, dict):
+                continue
+            for key in ("remark", "extMsg", "extmsg"):
+                text = str(source.get(key) or "").strip()
+                if text:
+                    return text
+        return ""
+
+    def _apply_server_remark(self, remark):
+        """服务端备注非空 → 补充显示（与本地备注去重拼接，各占一行）。"""
+        remark = str(remark or "").strip()
         if not remark or remark in self._remark_parts:
             return
         self._remark_parts.append(remark)
@@ -1159,8 +1329,12 @@ class CourseInfoDialog(MessageBoxBase):
         self._fill_detail_long(node)
         # 服务端类别真相覆盖本地页签推导值（kclb/publicCourseTypeName 为空时不动）
         self._override_local_kind(node)
-        # 服务端备注（remark 优先，extMsg 回落）补充显示（去重拼接，见实现）
-        self._apply_server_remark(node)
+        # 服务端备注（data.remark/extMsg 优先，顶层 extmsg 兜底）补充显示，
+        # 并回传给卡片（列表行无备注时补齐，见 CourseCard._on_server_remark）
+        remark = self._extract_server_remark(data)
+        if remark:
+            self._apply_server_remark(remark)
+            self.serverRemarkResolved.emit(remark)
 
     def _fill_kv_grid(self, grid, fields, node):
         """把 (标题, 编码键) 字段表填进 key-value 网格（两列键值对）。"""

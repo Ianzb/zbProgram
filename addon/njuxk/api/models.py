@@ -169,6 +169,23 @@ class Menu:
     parent_menu_code: str = ""
 
 
+def _remark_from_row(row: Dict[str, Any]) -> str:
+    """课程行备注：``extInfo`` 优先，依次回落 ``comment`` / ``extMsg`` / ``extmsg``。
+
+    抓包实证：结果行与 publicCourse 行的备注承载字段都是 ``extInfo``（单行如
+    「请选课学生加入QQ群：…」，也可为多行长通知）；``comment`` 仅接受 str，
+    非 str 脏值吞为空串（防 dict/int 流进展示层）；programCourse 父级与详情
+    接口分别用 ``extMsg`` / ``extmsg`` 承载同类信息，作为兜底。
+    """
+    remark = _s(row.get("extInfo")).strip()
+    if remark:
+        return remark
+    comment = row.get("comment")
+    if isinstance(comment, str) and comment.strip():
+        return comment.strip()
+    return _s(row.get("extMsg")).strip() or _s(row.get("extmsg")).strip()
+
+
 def from_public_course(
         row: Dict[str, Any],
         course_kind: str,
@@ -200,6 +217,7 @@ def from_public_course(
         hours=_s(row.get("hours")),
         kcjj=_s(row.get("kcjj")),
         batch_code=_s(batch_code),
+        remark=_remark_from_row(row),
     )
 
 
@@ -239,6 +257,8 @@ def from_program_course(
         hours=_s(course_row.get("hours")),
         kcjj=_s(course_row.get("kcjj")),
         batch_code=_s(batch_code),
+        # 备注可能在父级 course_row，也可能挂在子教学班 tc 上，两处都取
+        remark=_remark_from_row(course_row) or _remark_from_row(tc),
     )
 
 
@@ -269,13 +289,8 @@ def from_result_row(
     teaching_class_type = _s(row.get("teachingClassType"))
     kclx = _s(row.get("kclx")).strip()
     category = kclx or MENU_CODE_NAMES.get(teaching_class_type, teaching_class_type)
-    # 备注：extInfo 优先（抓包实证的承载字段），为空回落 comment；
-    # comment 非 str 脏值吞为空串（extInfo 走 _s，任意值安全字符串化）
-    remark = _s(row.get("extInfo")).strip()
-    if not remark:
-        comment = row.get("comment")
-        if isinstance(comment, str):
-            remark = comment.strip()
+    # 备注：extInfo 优先（抓包实证的承载字段），为空回落 comment / extMsg
+    remark = _remark_from_row(row)
     return Course(
         teaching_class_id=_s(row.get("teachingClassID")),
         course_number=_s(row.get("courseNumber")),
@@ -469,3 +484,55 @@ def selection_probability(course: Course, tactic_name: str | None = None) -> str
     pct = round(capacity / applicants * 100)  # 4. 抽签：容量 / 报名人数
     pct = max(0, min(100, pct))  # 夹取：容量 > 报名人数等异常数据 → 100%
     return f"{pct}%"
+
+
+def remaining_seats(course: Course) -> int | None:
+    """先到先得课程的剩余名额 = 容量 - 已选人数（展示/抢课门控用）。
+
+    - 容量不可解析（缺失/非数字）→ ``None``（无法判断，调用方应放行请求）；
+    - 已选人数不可解析/为空 → 视为 0（尚未有人占用）；
+    - 结果为 ``int``，可能为负（超额），调用方按 ``<= 0`` 视为已满。
+    """
+    capacity = _to_float(course.class_capacity)
+    if capacity is None:
+        return None
+    selected = _to_float(course.number_of_selected)
+    if selected is None:
+        selected = 0.0
+    return int(capacity - selected)
+
+
+def parse_course_rows(
+        rows,
+        teaching_class_type: str,
+        course_kind: str,
+        batch_code: str,
+) -> List[Course]:
+    """把课程查询 ``dataList`` 行解析成 ``Course`` 列表（按类别路由）。
+
+    - ``teaching_class_type == "ZY"`` → ``programCourse.do`` 父子结构，逐条
+      ``tcList`` 展开（``from_program_course``）；
+    - 其余 → 扁平行（``from_public_course``）。
+
+    非 dict 行安全跳过；``tcList`` 非 list 时按空处理。供选课页、收藏页刷新
+    占用与调度器「先到先得余量检测」共用，避免各处重复实现路由逻辑。
+    """
+    courses: List[Course] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if teaching_class_type == "ZY":
+            for tc in row.get("tcList") or []:
+                if isinstance(tc, dict):
+                    courses.append(
+                        from_program_course(
+                            row, tc, course_kind, teaching_class_type, batch_code
+                        )
+                    )
+        else:
+            courses.append(
+                from_public_course(
+                    row, course_kind, teaching_class_type, batch_code
+                )
+            )
+    return courses

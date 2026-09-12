@@ -43,6 +43,7 @@ import zbWidgetLib as zbw
 from ..core import settings as core_settings
 from ..core import state
 from ..core.scheduler import TaskState
+from .info import info_parent
 from .layout import SPACING, apply_card_margins, apply_page_margins
 from .text_select import make_selectable
 
@@ -71,6 +72,7 @@ class TaskCard(zbw.CardWidget):
     paramsChanged = Signal(str, dict)
     setStatusSignal = Signal(str)
     setProgressSignal = Signal(int, int)
+    setSeatCheckSignal = Signal(int)
     setCountdownSignal = Signal(str)
     setFinishedSignal = Signal(bool, str)
 
@@ -123,6 +125,13 @@ class TaskCard(zbw.CardWidget):
         self.timerSwitch.setChecked(getattr(self, "_initial_timed", True))
         self.beginTimeLabel = make_selectable(BodyLabel("批次开始：--", self))
         self.beginTimeLabel.setTextColor("#606060", "#d2d2d2")
+        # 两种请求数量分别标注：抢课请求（volunteer）+ 余量检测。所有任务统一走
+        # 抢课逻辑（开始先无条件申请一次，之后每轮查余量），因此恒显示
+        self._seat_checks = 0
+        self.requestStatsLabel = make_selectable(
+            BodyLabel("抢课请求 0 次 · 余量检测 0 次", self)
+        )
+        self.requestStatsLabel.setTextColor("#606060", "#d2d2d2")
 
         self.delayMinEdit = LineEdit(self)
         self.delayMaxEdit = LineEdit(self)
@@ -155,6 +164,7 @@ class TaskCard(zbw.CardWidget):
         row3 = QHBoxLayout()
         row3.addWidget(self.timerSwitch)
         row3.addWidget(self.beginTimeLabel, 1)
+        row3.addWidget(self.requestStatsLabel)
 
         # 第四行：随机延迟区间 + 重复次数（参数说明文字同样可选中复制）
         row4 = QHBoxLayout()
@@ -190,6 +200,7 @@ class TaskCard(zbw.CardWidget):
         )
         self.setStatusSignal.connect(self._on_status)
         self.setProgressSignal.connect(self._on_progress)
+        self.setSeatCheckSignal.connect(self._on_seat_check)
         self.setCountdownSignal.connect(self._on_countdown)
         self.setFinishedSignal.connect(self._on_finished)
         self.delayMinEdit.editingFinished.connect(self._on_delay_min_edited)
@@ -214,6 +225,10 @@ class TaskCard(zbw.CardWidget):
         """线程安全更新进度：total<=0 表示不限次数，显示「已尝试 N 次」。"""
         self.setProgressSignal.emit(int(done), int(total))
 
+    def set_seat_check(self, count: int):
+        """线程安全更新余量检测次数。"""
+        self.setSeatCheckSignal.emit(int(count))
+
     def set_countdown(self, seconds: int):
         """线程安全更新倒计时（秒）；等待中状态下状态文本显示「倒计时 Ns」。"""
         self.setCountdownSignal.emit(str(int(seconds)))
@@ -233,13 +248,27 @@ class TaskCard(zbw.CardWidget):
     def _on_progress(self, done: int, total: int):
         self._done = done
         self._total = total
-        if total > 0:
-            pct = min(100, int(done / total * 100)) if total else 0
+        self._refresh_progress()
+
+    def _on_seat_check(self, count: int):
+        self._seat_checks = int(count)
+        self._refresh_progress()
+
+    def _refresh_progress(self):
+        """刷新进度：总数 = 抢课请求 + 余量检测，两种请求数量分别标注。"""
+        total_requests = self._done + self._seat_checks
+        if self._total > 0:
+            pct = min(100, int(total_requests / self._total * 100))
             self.progressBar.setValue(pct)
-            self.progressLabel.setText(f"已尝试 {done} / 总数 {total}")
+            self.progressLabel.setText(
+                f"已尝试 {total_requests} / 总数 {self._total}"
+            )
         else:
             self.progressBar.setValue(0)
-            self.progressLabel.setText(f"已尝试 {done} 次")
+            self.progressLabel.setText(f"已尝试 {total_requests} 次")
+        self.requestStatsLabel.setText(
+            f"抢课请求 {self._done} 次 · 余量检测 {self._seat_checks} 次"
+        )
 
     def apply_state(self, state: str):
         """按调度器状态统一切换「开始/继续」与「停止」按钮的可用性与文案。
@@ -458,9 +487,9 @@ class TaskPage(QWidget):
     设置入口在 MainPage 顶栏的账号菜单里（原任务页「设置」按钮已移除）。
     """
 
-    # InfoBar / 对话框挂载标记：``ui/cards.py`` 的 ``_dialog_parent`` 沿 parent
-    # 链上溯找插件页面（原来只认 ``zbw.BasicTab``），本页改基类后靠此标记继续
-    # 被识别为插件页面 —— 弹窗遮罩仍覆盖整个任务页，绝不提升到宿主主窗口
+    # 通知/对话框挂载标记：早期 ``ui/cards.py::_dialog_parent`` 依赖它识别插件页；
+    # 现在通知统一由 ``ui/info.info_parent`` 提升到插件最高层级页面（MainPage），
+    # 本标记保留以兼容既有测试/外部引用
     _info_parent_flag = True
 
     taskStartRequested = Signal(str)
@@ -485,7 +514,7 @@ class TaskPage(QWidget):
         # 页根布局：工具行 + 任务列表滚动区（前者固定，后者滚动）。
         # 页面级边距/间距统一取自 ui.layout（与选课页、收藏页同一套常量）
         self.vBoxLayout = QVBoxLayout(self)
-        apply_page_margins(self.vBoxLayout)
+        apply_page_margins(self.vBoxLayout, bottom=0)
 
         # 顶部工具行：「一键清空」（设置对话框已删除，这是清空任务的唯一入口）
         # —— 固定在页根（保持原位置：列表上方），不随列表滚动
@@ -516,7 +545,7 @@ class TaskPage(QWidget):
         # 页面背景形成大色块）。写法对齐旧版 zbw.BasicTab（BetterScrollArea.view）。
         inner.setStyleSheet("QWidget {background-color: rgba(0,0,0,0); border: none}")
         innerLayout = QVBoxLayout(inner)
-        innerLayout.setContentsMargins(0, 4, 0, 8)
+        innerLayout.setContentsMargins(0, 4, 0, 0)
         innerLayout.setSpacing(SPACING)
 
         # 任务卡片列表（在滚动内容里，自然高度不占 stretch）
@@ -527,6 +556,11 @@ class TaskPage(QWidget):
         self.emptyLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.emptyLabel.setTextColor("#606060", "#d2d2d2")
         innerLayout.addWidget(self.emptyLabel)
+
+        # 末尾弹簧吸收多余纵向空间：CardGroup 纵向策略是 Preferred，滚动内容又被
+        # widgetResizable(True) 撑到整个视口高，没有弹簧时列表区会被拉得比卡片总高
+        # 出一截（用户反馈各页多出的空白还不一样）。弹簧让列表按内容自然高度贴顶。
+        innerLayout.addStretch(1)
 
         # 任务列表滚动区独占剩余纵向空间（stretch=1），工具行保持固有高度
         self.vBoxLayout.addWidget(self.taskScroll, 1)
@@ -599,8 +633,8 @@ class TaskPage(QWidget):
                 isClosable=True,
                 duration=3000,
                 position=InfoBarPosition.TOP_RIGHT,
-                # 提示挂任务页自身，随页面显示（不挂宿主主窗口）
-                parent=self,
+                # 提示统一挂插件最高层级页面（MainPage），随插件页面显示
+                parent=info_parent(self),
             )
             return existing
         card = TaskCard(course, setting=self._setting, parent=self)
@@ -655,8 +689,8 @@ class TaskPage(QWidget):
             "确定清空全部任务？（正在运行的任务也会停止，该操作无法撤销！）",
             isClosable=False,
             duration=-1,
-            # 提示挂任务页自身，随页面显示（不挂宿主主窗口）
-            parent=self,
+            # 提示统一挂插件最高层级页面（MainPage），随插件页面显示
+            parent=info_parent(self),
         )
 
         def confirm():

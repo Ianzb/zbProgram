@@ -29,7 +29,7 @@
 """
 from __future__ import annotations
 
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, Signal
 from qtpy.QtGui import QDoubleValidator, QIntValidator
 from qtpy.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget
 
@@ -49,6 +49,7 @@ import zbWidgetLib as zbw
 
 from ..core import state
 from ..core.settings import DEFAULTS
+from .info import info_parent
 from .layout import apply_card_margins
 
 
@@ -76,6 +77,9 @@ def _parse_int(text, lo: int, hi: int):
 
 class SettingsDialog(MessageBoxBase):
     """全局默认调度配置设置弹窗（两个分组，键名行 + 右侧控件）。"""
+
+    #: 配置保存成功（落盘后发出）——装配层据此让调度器**即时重载**并发/限速参数
+    configSaved = Signal()
 
     #: 弹窗固定宽度（照 CourseInfoDialog.WIDTH 范式；两列行布局 560 足够）
     WIDTH = 560
@@ -218,9 +222,9 @@ class SettingsDialog(MessageBoxBase):
     # ------------------------------------------------------------------
 
     def _info_parent(self):
-        """保存结果提示挂弹窗的父窗口（MainPage），随插件页面显示；
+        """保存结果提示挂弹窗的父窗口：插件最高层级页面（MainPage）；
         无父窗口（纯测试）时挂弹窗自身，绝不挂宿主主窗口。"""
-        return self.parent() if self.parent() is not None else self
+        return info_parent(self)
 
     def _popup(self, icon: InfoBarIcon, title: str, content: str):
         InfoBar(
@@ -242,9 +246,11 @@ class SettingsDialog(MessageBoxBase):
             return False
         if self._setting is not None:
             state.save_scheduler_config(self._setting, cfg)
+        # 通知装配层让调度器即时重载（并发/最小间隔/QoS 退避立即生效）
+        self.configSaved.emit()
         self._popup(
             InfoBarIcon.SUCCESS,
             "设置已保存",
-            "新建任务默认值对下一张新任务卡生效；调度器参数在下次任务启动时生效",
+            "新建任务默认值对下一张新任务卡生效；调度器参数已即时生效",
         )
         return True

@@ -37,6 +37,7 @@ import zbWidgetLib as zbw
 
 from ..api.client import XkClient
 from ..core import state
+from .info import info_parent
 from .layout import SPACING, TOOL_SPACING
 from .text_select import make_selectable
 
@@ -166,12 +167,12 @@ class LoginCard(zbw.HeaderCardWidget):
         self._main_page = page
 
     def _loading_parent(self):
-        """Loading 遮罩父窗口：MainPage（插件页顶层容器），未注入退回自身。
+        """Loading 遮罩父窗口：插件最高层级页面（MainPage），未挂载退回自身。
 
         需求：遮罩要覆盖整个插件页区域（parent 层级够高），但绝不提升到
         宿主主窗口（那是上一轮明令禁止的挂法）。
         """
-        return self._main_page if self._main_page is not None else self
+        return info_parent(self)
 
     def reset(self):
         """复位登录卡：清空状态标签、恢复按钮可用、关闭遗留 Loading。
@@ -211,10 +212,8 @@ class LoginCard(zbw.HeaderCardWidget):
         self.accountCombo.addItem("手动输入", userData="")
         for acc in accounts:
             user = acc["user"]
-            pwd = acc.get("pwd", "")
-            self.accountCombo.addItem(
-                f"{user}（{'已存密码' if pwd else '未存密码'}）", userData=user
-            )
+            # 只显示学号，不再附带「已存密码/未存密码」字样（用户要求）
+            self.accountCombo.addItem(user, userData=user)
         self.accountCombo.setCurrentIndex(0)
         self.accountCombo.blockSignals(False)
         self.deleteAccountButton.setEnabled(False)
@@ -261,7 +260,7 @@ class LoginCard(zbw.HeaderCardWidget):
         box = MessageBox(
             "确认删除？",
             f"将永久删除账号 {user} 的保存记录\n此操作不可恢复",
-            self,
+            info_parent(self),
         )
         box.yesButton.setText("永久删除")
         box.cancelButton.setText("取消")
@@ -278,7 +277,7 @@ class LoginCard(zbw.HeaderCardWidget):
             isClosable=True,
             duration=3000,
             position=InfoBarPosition.TOP_RIGHT,
-            parent=self,
+            parent=info_parent(self),
         )
 
     # ------------------------------------------------------------------
@@ -359,6 +358,6 @@ class LoginCard(zbw.HeaderCardWidget):
                 isClosable=True,
                 duration=5000,
                 position=InfoBarPosition.TOP_RIGHT,
-                # 提示挂插件自己的组件（登录卡），绝不挂宿主主窗口
-                parent=self,
+                # 提示统一挂插件最高层级页面（MainPage），绝不挂宿主主窗口
+                parent=info_parent(self),
             )

@@ -14,6 +14,8 @@ from qfluentwidgets import (
     Action,
     BodyLabel,
     FluentIcon as FIF,
+    InfoBadge,
+    InfoBadgePosition,
     PushButton,
     RoundMenu,
     SubtitleLabel,
@@ -90,6 +92,10 @@ class MainPage(QWidget):
     宿主契约：``addonWidget()`` 返回对象仍提供 ``title()`` / ``icon()``。
     """
 
+    #: 插件最高层级页面标记：``ui.info.info_parent`` 沿 parent 链据此找到本页，
+    #: 使所有 InfoBar / 遮罩 / 对话框统一挂到这里（见需求「统一通知挂最高层级」）
+    _is_main_page = True
+
     #: 点击顶栏「设置」按钮（由装配层 XkApp 接线 → 打开 SettingsDialog）
     settingsRequested = Signal()
 
@@ -121,9 +127,11 @@ class MainPage(QWidget):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        # 页面级边距/间距统一取自 ui.layout（与各页同一套常量，不写死）
+        # 页面级边距/间距统一取自 ui.layout（与各页同一套常量，不写死）。
+        # 底部边距为 0：滚动列表页本身也去掉了底部边距，这里再收掉容器边距，
+        # 使列表滚动到窗口最下方时无留白。
         root = QVBoxLayout(self)
-        apply_page_margins(root)
+        apply_page_margins(root, bottom=0)
 
         # ---- 顶栏：左标题 + 右账号按钮（页签区域之外的插件页级常驻区域）----
         self.topBar = QWidget(self)
@@ -189,6 +197,60 @@ class MainPage(QWidget):
         # （首个 addPage），槽里对非结果页直接 no-op
         self.tabs.stackedWidget.currentChanged.connect(self._on_tab_changed)
         self.stack.addWidget(self.tabs)
+        # 任务页签数字徽标（当前任务数量），随任务增删实时更新
+        self._setup_task_badge(app)
+
+    def _setup_task_badge(self, app):
+        """在「任务」页签上挂一个数字徽标（qfluentwidgets InfoBadge）。
+
+        徽标附着在 ``Pivot`` 的「任务」项（``PivotItem``）右上角；数量为 0 时
+        隐藏。任务卡片增删经 ``app.task_page.cardCountChanged`` 通知刷新。
+
+        位置修正：``InfoBadgePosition.TOP_RIGHT`` 把徽标**中心**对到页签右上角，
+        徽标有一半越过页签顶边，会被上方组件（页头 / Pivot 顶边）挡住（用户
+        实测反馈）。这里把 manager 算出的位置整体下移半个徽标高度，改为顶边
+        对齐，使徽标完整落在页签内；resize/move 时 manager 仍走同一份位置逻辑。
+        """
+        item = getattr(self.tabs.pivot, "items", {}).get("任务")
+        if item is None:
+            return
+        self._taskBadge = InfoBadge.attension(
+            "0",
+            parent=self.tabs.pivot,
+            target=item,
+            position=InfoBadgePosition.TOP_RIGHT,
+        )
+        manager = self._taskBadge.manager
+        if manager is not None:
+            base_position = manager.position
+
+            def _nudged_position():
+                # TOP_RIGHT 默认把徽标**中心**对到页签右上角（一半越过顶边、一半
+                # 探出右边）。这里整体往左下挪：左移半个徽标宽（右边缘与页签右边缘
+                # 对齐）、下移一个徽标高（落在页签内侧中上部），避免被上方组件挡住。
+                pos = base_position()
+                return QPoint(
+                    pos.x() - self._taskBadge.width() // 2,
+                    pos.y() + self._taskBadge.height(),
+                )
+
+            manager.position = _nudged_position
+        self._taskBadge.hide()
+        app.task_page.cardCountChanged.connect(self._on_task_count_changed)
+
+    def _on_task_count_changed(self, count):
+        """任务数量变化：更新/隐藏任务页签徽标。"""
+        badge = getattr(self, "_taskBadge", None)
+        if badge is None:
+            return
+        if count and count > 0:
+            badge.setText(str(int(count)))
+            badge.adjustSize()
+            badge.show()
+            if badge.manager is not None:
+                badge.move(badge.manager.position())
+        else:
+            badge.hide()
 
     def _on_tab_changed(self, index):
         """页签切换：当前页是结果页且置脏/从未加载过 → 触发一次加载。"""

@@ -15,9 +15,9 @@ is_choose``；刷新失败保留旧快照并提示「刷新失败，显示本地
 策略名）。收藏页没有批次上下文，渲染卡片时用它算选中概率；老记录缺该键时按空串
 处理，由 :func:`~njuxk.api.models.selection_probability` 的兜底分支显示 100%。
 
-一键开始全部抢课：跳过 ``is_choose=="1"``（已在课表）；``is_full=="1"``（已满）
-默认也跳过（``CheckBox``「跳过已满课程」控制，默认勾选）；对剩余每条发出
-``grabRequested`` 并批量发出 ``grabAllRequested``（由外部接入任务页）。
+一键开始全部抢课：只跳过 ``is_choose=="1"``（已在课表）；其余（含已满课程，
+满员也值得加入抢课捡漏）逐条发出 ``grabRequested`` 并批量发出
+``grabAllRequested``（由外部接入任务页）。
 
 线程约定（对齐 ``ui/course.py`` / ``ui/login.py``）：
 - 所有网络请求走 ``program.THREAD_POOL``（宿主线程池），无宿主时用本地兜底池；
@@ -35,7 +35,6 @@ from qtpy.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget
 
 from qfluentwidgets import (
     BodyLabel,
-    CheckBox,
     FluentIcon as FIF,
     InfoBar,
     InfoBarIcon,
@@ -51,6 +50,7 @@ from ..api import models
 from ..api.client import XkClient
 from ..core import state
 from .cards import CourseCard
+from .info import info_parent
 from .layout import SPACING, apply_page_margins, apply_tool_row
 from .login import _host_program, _host_setting
 from .text_select import make_selectable
@@ -63,7 +63,7 @@ class FavoritesPage(QWidget):
     本页**不再**继承 ``zbw.BasicTab``（BasicTab 整页就是一个纵向滚动区，工具行
     会跟着收藏卡片一起滚走），改为普通 ``QWidget`` 页根布局 + 内部唯一一个纵向
     ``SmoothScrollArea``（``favScroll``）—— 工具行（刷新占用 / 一键开始全部抢课 /
-    跳过已满课程 / 清空收藏）固定在页根，只有收藏卡片列表（cardGroup /
+    清空收藏）固定在页根，只有收藏卡片列表（cardGroup /
     emptyLabel）在 ``favScroll`` 里滚动。``BasicTabPage.addPage`` 只要求 widget
     本身，不要求 BasicTab 类型，页签行为不变。
 
@@ -75,9 +75,9 @@ class FavoritesPage(QWidget):
         favoritesChanged()      —— 收藏集合结构变化（移除/清空）
     """
 
-    # InfoBar / 对话框挂载标记：``ui/cards.py`` 的 ``_dialog_parent`` 沿 parent
-    # 链上溯找插件页面（原来只认 ``zbw.BasicTab``），本页改基类后靠此标记继续
-    # 被识别为插件页面 —— 弹窗遮罩仍覆盖整个收藏页，绝不提升到宿主主窗口
+    # 通知/对话框挂载标记：早期 ``ui/cards.py::_dialog_parent`` 依赖它识别插件页；
+    # 现在通知统一由 ``ui/info.info_parent`` 提升到插件最高层级页面（MainPage），
+    # 本标记保留以兼容既有测试/外部引用
     _info_parent_flag = True
 
     grabRequested = Signal(str)
@@ -89,11 +89,13 @@ class FavoritesPage(QWidget):
     _refreshReady = Signal(object)
     _refreshError = Signal(object)
 
-    def __init__(self, parent=None, client=None, setting=None, program=None):
+    def __init__(self, parent=None, client=None, setting=None, program=None,
+                 ratings=None):
         super().__init__(parent)
         self.client = client if client is not None else XkClient()
         self._setting = setting
         self._program = program
+        self._ratings = ratings
         # 插件主页面（MainPage）引用：Loading 遮罩挂它（覆盖整个插件页区域，
         # 不覆盖宿主主窗口）；MainPage 创建后经 set_main_page 注入
         self._main_page = None
@@ -141,19 +143,16 @@ class FavoritesPage(QWidget):
         # 页根布局：工具行 + 收藏列表滚动区（前者固定，后者滚动）。
         # 边距/间距统一取自 ui.layout（与选课页、任务页、设置对话框同一套常量）
         self.vBoxLayout = QVBoxLayout(self)
-        apply_page_margins(self.vBoxLayout)
+        apply_page_margins(self.vBoxLayout, bottom=0)
 
-        # 顶部工具行：刷新占用 / 一键开始全部抢课 / 跳过已满课程 / 清空收藏
+        # 顶部工具行：刷新占用 / 一键开始全部抢课 / 清空收藏
         # （固定在页根，不随列表滚动）
         toolRow = apply_tool_row(QHBoxLayout())
         self.refreshButton = PushButton(FIF.SYNC, "刷新占用", self)
         self.grabAllButton = PrimaryPushButton(FIF.PLAY, "一键开始全部抢课", self)
-        self.skipFullCheck = CheckBox("跳过已满课程", self)
-        self.skipFullCheck.setChecked(True)
         self.clearButton = PushButton(FIF.DELETE, "清空收藏", self)
         toolRow.addWidget(self.refreshButton)
         toolRow.addWidget(self.grabAllButton)
-        toolRow.addWidget(self.skipFullCheck)
         toolRow.addStretch(1)
         toolRow.addWidget(self.clearButton)
         self.vBoxLayout.addLayout(toolRow)
@@ -179,7 +178,7 @@ class FavoritesPage(QWidget):
         # 页面背景形成大色块）。写法对齐旧版 zbw.BasicTab（BetterScrollArea.view）。
         inner.setStyleSheet("QWidget {background-color: rgba(0,0,0,0); border: none}")
         innerLayout = QVBoxLayout(inner)
-        innerLayout.setContentsMargins(0, 4, 0, 8)
+        innerLayout.setContentsMargins(0, 4, 0, 0)
         innerLayout.setSpacing(SPACING)
 
         # 列表区：CardGroup 装 CourseCard（在滚动内容里，自然高度不占 stretch）
@@ -192,6 +191,11 @@ class FavoritesPage(QWidget):
         self.emptyLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.emptyLabel.setTextColor("#606060", "#d2d2d2")
         innerLayout.addWidget(self.emptyLabel)
+
+        # 末尾弹簧吸收多余纵向空间：CardGroup 纵向策略是 Preferred，滚动内容又被
+        # widgetResizable(True) 撑到整个视口高，没有弹簧时列表区会被拉得比卡片总高
+        # 出一截（用户反馈各页多出的空白还不一样）。弹簧让列表按内容自然高度贴顶。
+        innerLayout.addStretch(1)
 
         # 收藏列表滚动区独占剩余纵向空间（stretch=1），工具行保持固有高度
         self.vBoxLayout.addWidget(self.favScroll, 1)
@@ -227,11 +231,19 @@ class FavoritesPage(QWidget):
                 tactic_name=str(fav.get("tactic_name") or ""),
                 favorited=True,
             )
+            card.set_rating(self._lookup_rating(card.course))
             card.favoriteToggled.connect(self._on_card_favorite_toggled)
             card.grabRequested.connect(self.grabRequested)
             card.dropRequested.connect(self.dropRequested)
+            card.remarkResolved.connect(self._on_remark_resolved)
             self.cardGroup.addCard(card, wid=tid)
         self._update_empty()
+
+    def _on_remark_resolved(self, teaching_class_id, remark):
+        """详情接口回填的备注写入本地收藏记录（下次渲染卡片即可显示）。"""
+        setting = self.setting
+        if setting is not None and remark:
+            state.update_favorite(setting, teaching_class_id, {"remark": remark})
 
     def _update_empty(self):
         self.emptyLabel.setVisible(self.cardGroup.count() == 0)
@@ -245,6 +257,16 @@ class FavoritesPage(QWidget):
             for k, v in record.items()
             if k in valid
         })
+
+    def _lookup_rating(self, course):
+        """按课程名 + 教师匹配红黑榜评价；无数据源/未匹配返回 None。"""
+        if self._ratings is None or course is None:
+            return None
+        try:
+            return self._ratings.lookup(course.course_name, course.teacher_name)
+        except Exception as e:  # noqa: BLE001 - 匹配失败不影响卡片
+            logging.debug("红黑榜匹配失败：%s", e)
+            return None
 
     # ------------------------------------------------------------------
     # 移除 / 清空
@@ -278,8 +300,8 @@ class FavoritesPage(QWidget):
             "确定清空全部收藏？（该操作无法撤销！）",
             isClosable=False,
             duration=-1,
-            # 提示挂收藏页自身，随页面显示（不挂宿主主窗口）
-            parent=self,
+            # 提示统一挂插件最高层级页面（MainPage），随插件页面显示（不挂宿主主窗口）
+            parent=info_parent(self),
         )
 
         def confirm():
@@ -297,7 +319,7 @@ class FavoritesPage(QWidget):
                 isClosable=True,
                 duration=3000,
                 position=InfoBarPosition.TOP_RIGHT,
-                parent=self,
+                parent=info_parent(self),
             )
 
         def cancel():
@@ -411,7 +433,7 @@ class FavoritesPage(QWidget):
             isClosable=True,
             duration=3000,
             position=InfoBarPosition.TOP_RIGHT,
-            parent=self,
+            parent=info_parent(self),
         )
 
     def _on_refresh_error(self, msg):
@@ -424,7 +446,7 @@ class FavoritesPage(QWidget):
             isClosable=True,
             duration=5000,
             position=InfoBarPosition.TOP_RIGHT,
-            parent=self,
+            parent=info_parent(self),
         )
 
     # ------------------------------------------------------------------
@@ -436,7 +458,6 @@ class FavoritesPage(QWidget):
         if setting is None:
             return
         favorites = state.list_favorites(setting)
-        skip_full = self.skipFullCheck.isChecked()
         to_grab = []
         skipped = 0
         for fav in favorites:
@@ -446,9 +467,6 @@ class FavoritesPage(QWidget):
             if not tid:
                 continue
             if str(fav.get("is_choose", "")) == "1":
-                skipped += 1
-                continue
-            if skip_full and str(fav.get("is_full", "")) == "1":
                 skipped += 1
                 continue
             to_grab.append(tid)
@@ -463,7 +481,7 @@ class FavoritesPage(QWidget):
             isClosable=True,
             duration=3000,
             position=InfoBarPosition.TOP_RIGHT,
-            parent=self,
+            parent=info_parent(self),
         )
 
     # ------------------------------------------------------------------
@@ -471,10 +489,9 @@ class FavoritesPage(QWidget):
     # ------------------------------------------------------------------
 
     def _show_loading(self):
-        # 遮罩挂 MainPage（插件页顶层容器）：覆盖整个插件页区域，不覆盖宿主
-        # 主窗口；MainPage 未注入时（独立构造/测试）退回收藏页自身
-        parent = self._main_page if self._main_page is not None else self
-        self._loading_box = zbw.LoadingMessageBox(parent)
+        # 遮罩统一挂插件最高层级页面（MainPage）：覆盖整个插件页区域，不覆盖
+        # 宿主主窗口；MainPage 未注入/未挂载时退回收藏页自身
+        self._loading_box = zbw.LoadingMessageBox(info_parent(self))
         self._loading_box.setText("正在刷新占用…")
         self._loading_box.show()
 

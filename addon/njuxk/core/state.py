@@ -277,3 +277,41 @@ def load_selection(setting) -> tuple:
     if not isinstance(category, str):
         category = ""
     return batch, category
+
+
+# ==================== 红黑榜缓存 ====================
+
+
+def load_ratings_cache(setting) -> dict:
+    """读取红黑榜原始数据缓存（``{"timestamp", "raw"}`` 的 ``raw``）。
+
+    缺失 / 损坏 / 非 dict 一律回退空 dict（调用方视为「无缓存」）。
+    """
+    value = setting.read("ratings_cache")
+    if isinstance(value, dict):
+        raw = value.get("raw")
+        if isinstance(raw, dict):
+            return raw
+    return {}
+
+
+def save_ratings_cache(setting, raw: dict) -> None:
+    """写入红黑榜原始数据缓存（带同步时间戳）；非 dict 忽略。"""
+    if not isinstance(raw, dict):
+        return
+    setting.save("ratings_cache", {
+        "timestamp": int(time.time()),
+        "raw": raw,
+    })
+
+
+def ratings_cache_timestamp(setting) -> int:
+    """读取红黑榜缓存同步时间戳（秒）；缺失 / 损坏回退 0。"""
+    value = setting.read("ratings_cache")
+    if isinstance(value, dict):
+        ts = value.get("timestamp")
+        try:
+            return int(ts)
+        except (TypeError, ValueError):
+            return 0
+    return 0
