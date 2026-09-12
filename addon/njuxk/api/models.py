@@ -456,9 +456,11 @@ def selection_probability(course: Course, tactic_name: str | None = None) -> str
     规则（**顺序即语义，不可调换**）：
     1. ``is_full == "1"``（服务端标记已满）→ ``"0%"``，优先于一切；
     2. 容量不可解析（缺失/非数字）→ ``"—"``；容量 ``<= 0`` → ``"0%"``；
-    3. 报名人数不可解析/为空/``None``/``<= 0`` → 视为无人报名 → 无人竞争
+    3. 已选（报名人数）**为空**（缺失/空串/纯空白，卡片显示 ``/XXX``）→ ``"无"``
+       （没有报名人数，无法计算概率）；
+    4. 报名人数不可解析/``<= 0``（如 ``"0"``）→ 视为无人报名 → 无人竞争
        → ``"100%"``（如 ``0/185``）；
-    4. ``pct = round(容量 / 报名人数 * 100)``，夹取到 ``[0, 100]``
+    5. ``pct = round(容量 / 报名人数 * 100)``，夹取到 ``[0, 100]``
        （容量 > 报名人数时结果 ``> 100%``，夹取为 ``"100%"``）。
 
     为什么只用这两个数字（用户明确要求）：
@@ -478,10 +480,13 @@ def selection_probability(course: Course, tactic_name: str | None = None) -> str
         return "—"  # 2. 容量缺失，无法计算
     if capacity <= 0:
         return "0%"  # 2. 容量为 0（或异常负值），无人能被抽中
-    applicants = _to_float(course.number_of_selected)
+    selected = course.number_of_selected
+    if selected is None or not str(selected).strip():
+        return "无"  # 3. 已选为空（卡片显示 /XXX）→ 无法计算概率
+    applicants = _to_float(selected)
     if applicants is None or applicants <= 0:
-        return "100%"  # 3. 无人报名（0/185）→ 无人竞争 → 100%
-    pct = round(capacity / applicants * 100)  # 4. 抽签：容量 / 报名人数
+        return "100%"  # 4. 无人报名（0/185）→ 无人竞争 → 100%
+    pct = round(capacity / applicants * 100)  # 5. 抽签：容量 / 报名人数
     pct = max(0, min(100, pct))  # 夹取：容量 > 报名人数等异常数据 → 100%
     return f"{pct}%"
 

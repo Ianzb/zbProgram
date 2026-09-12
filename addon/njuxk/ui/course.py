@@ -104,11 +104,20 @@ ALL_CAMPUSES = "全部校区"
 
 #: 类别 Tab 显示顺序（menuCode 列表，如 ``["GG02", "GG01", "ZY"]``）。
 #:
-#: 默认为用户指定的 8 类顺序：专业 → 研学/探讨/通识 → 科学之光 → 美育 → 公选 →
-#: 跨专业 → 体育 → 悦读。列表中的类别按此处顺序排在前面，常量**未收录**的类别
-#: 按服务端顺序追加在尾部（遗漏的 code 不丢失、不崩溃，如 TX01 大学数学）。
+#: 当前为用户指定的顺序：专业 → 研学/探讨/通识 → 科学之光 → 美育 → 公选 →
+#: 跨专业 → 体育。列表中的类别按此处顺序排在前面，常量**未收录**的类别按服务端
+#: 顺序追加在尾部（遗漏的 code 不丢失、不崩溃，如 TX01 大学数学）。
 #: 设为 ``[]`` 恢复「按服务端 limitMenuList 原顺序」。改动后重启宿主生效。
-CATEGORY_ORDER: list[str] = ["ZY", "GG02", "GG06", "MY", "GG01", "KZY", "TY", "YD"]
+CATEGORY_ORDER: list[str] = ["ZY", "GG02", "GG06", "MY", "GG01", "KZY", "TY"]
+
+#: 需要**隐藏**的类别 menuCode（服务端会下发，但不在类别区展示）。
+#: 用户需求：GG03 / GG04 / GG05 / 悦读(YD) 不显示。
+HIDDEN_CATEGORY_CODES: set[str] = {"GG03", "GG04", "GG05", "YD"}
+
+
+def _filter_hidden_menus(menus):
+    """剔除 ``HIDDEN_CATEGORY_CODES`` 中的类别菜单（隐藏，不在类别区展示）。"""
+    return [m for m in menus if m.menu_code not in HIDDEN_CATEGORY_CODES]
 
 
 def _sort_menus_by_category_order(menus):
@@ -608,6 +617,8 @@ class CoursePage(QWidget):
             if isinstance(m, dict)
         ]
         menus = models.filter_selectable_menus(menus)
+        # 隐藏指定类别（GG03/GG04/GG05/悦读），再按 CATEGORY_ORDER 重排
+        menus = _filter_hidden_menus(menus)
         # 类别 Tab 显示顺序：按 CATEGORY_ORDER 常量重排（常量为空 = 服务端原顺序）
         menus = _sort_menus_by_category_order(menus)
         self._menus = menus
